@@ -352,7 +352,10 @@ fn recursive_remove_removes_a_dangling_symlink() {
         .run(&Context::new(&root))
         .unwrap();
 
-    assert!(std::fs::symlink_metadata(&link).is_err());
+    assert!(matches!(
+        std::fs::symlink_metadata(&link),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ));
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -377,6 +380,26 @@ fn bounded_parallel_for_runs_every_iteration() {
     }
     assert_eq!(report.files_changed, 5);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_parallel_for_does_not_multiply_the_outer_limit() {
+    let started = std::time::Instant::now();
+    let source = r#"
+        parallel for outer in words "one two" limit 2
+          parallel for inner in words "left right" limit 2
+            $ sh -c "sleep .1"
+          end
+        end
+    "#;
+    let report = shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::default())
+        .unwrap();
+
+    assert_eq!(report.commands_run, 4);
+    assert!(started.elapsed() >= Duration::from_millis(180));
 }
 
 #[cfg(unix)]

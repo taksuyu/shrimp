@@ -169,6 +169,7 @@ impl Script {
             secrets: HashSet::new(),
             functions: HashMap::new(),
             call_depth: 0,
+            parallel_depth: 0,
             options,
             report: ScriptReport::default(),
         };
@@ -184,6 +185,7 @@ struct Runtime {
     secrets: HashSet<String>,
     functions: HashMap<String, (Vec<String>, Vec<Statement>)>,
     call_depth: usize,
+    parallel_depth: usize,
     options: ScriptOptions,
     report: ScriptReport,
 }
@@ -487,15 +489,18 @@ impl Runtime {
 
     fn parallel(&mut self, branches: &[Statement]) -> Result<()> {
         self.trace(&format!("parallel {} branches", branches.len()));
-        if self.options.dry_run {
+        if self.options.dry_run || self.parallel_depth > 0 {
             let mut first_error = None;
             for branch in branches {
                 let mut runtime = self.clone();
                 runtime.report = ScriptReport::default();
-                if let Err(error) = runtime.execute(std::slice::from_ref(branch))
-                    && first_error.is_none()
-                {
-                    first_error = Some(error);
+                match runtime.execute(std::slice::from_ref(branch)) {
+                    Ok(()) => {
+                        self.report.commands_run += runtime.report.commands_run;
+                        self.report.files_changed += runtime.report.files_changed;
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
                 }
             }
             return first_error.map_or(Ok(()), Err);
@@ -505,6 +510,7 @@ impl Runtime {
             .cloned()
             .map(|branch| {
                 let mut runtime = self.clone();
+                runtime.parallel_depth += 1;
                 thread::spawn(move || {
                     runtime.report = ScriptReport::default();
                     runtime.execute(&[branch])?;
@@ -549,11 +555,29 @@ impl Runtime {
             "parallel for {} items (limit {limit})",
             values.len()
         ));
+        if self.parallel_depth > 0 {
+            let mut first_error = None;
+            for value in values {
+                let mut runtime = self.clone();
+                runtime.variables.insert(name.into(), value);
+                runtime.report = ScriptReport::default();
+                match runtime.execute(body) {
+                    Ok(()) => {
+                        self.report.commands_run += runtime.report.commands_run;
+                        self.report.files_changed += runtime.report.files_changed;
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
+            }
+            return first_error.map_or(Ok(()), Err);
+        }
         for batch in values.chunks(limit) {
             let handles: Vec<_> = batch
                 .iter()
                 .map(|value| {
                     let mut runtime = self.clone();
+                    runtime.parallel_depth += 1;
                     runtime.variables.insert(name.into(), value.clone());
                     runtime.report = ScriptReport::default();
                     let body = body.to_vec();

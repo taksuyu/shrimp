@@ -154,7 +154,9 @@ end
 
 At most `limit` iterations run concurrently. Each iteration receives isolated
 variables, just like a branch in `parallel`, and Shrimp waits for every iteration in a
-started batch before reporting an error.
+started batch before reporting an error. A parallel construct nested inside another
+parallel construct executes its branches sequentially. This nesting boundary prevents
+inner loops or blocks from multiplying the concurrency selected by the outer workflow.
 
 ## Runner
 
