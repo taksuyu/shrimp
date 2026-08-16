@@ -242,14 +242,20 @@ impl Pipeline {
             .last()
             .and_then(|(_, _, status)| *status)
             .expect("completed final process");
-        if let Some((name, _, Some(status))) = children
+        if let Some((index, (name, _, Some(status)))) = children
             .iter()
-            .find(|(_, _, status)| status.is_some_and(|s| !s.success()))
+            .enumerate()
+            .find(|(_, (_, _, status))| status.is_some_and(|s| !s.success()))
         {
+            let failure_stderr = if index + 1 == children.len() {
+                stderr
+            } else {
+                Vec::new()
+            };
             return Err(Error::CommandFailed {
                 command: name.clone(),
                 status: *status,
-                stderr,
+                stderr: failure_stderr,
             });
         }
         Ok(CommandOutput {
@@ -368,7 +374,9 @@ fn poll_reader(receiver: &Receiver<Result<Vec<u8>>>, output: &mut Option<Vec<u8>
 fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     unsafe {
-        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        if libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) == -1 {
+            let _ = child.kill();
+        }
     }
     #[cfg(not(unix))]
     let _ = child.kill();

@@ -40,6 +40,11 @@ else
 end
 ```
 
+For the command-line `retry` statement, the number is the total number of attempts,
+not a count of additional retries. Shrimp waits a fixed 100ms between failed attempts.
+This convention is specific to the workflow language statement; the Rust embedding
+API's `Task::retry` method has its own documented argument semantics.
+
 Durations accept `ms`, `s`, or `m`. A timeout kills every direct child; on Unix each
 pipeline child has an isolated process group so descendants are killed too. Ordinary
 commands remain in the terminal's foreground process group and therefore receive

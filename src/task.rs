@@ -132,9 +132,13 @@ impl<T: 'static> Task<T> {
             thread::spawn(move || {
                 let _ = sender.send(task.run(&context));
             });
-            receiver
-                .recv_timeout(limit)
-                .map_err(|_| Error::Timeout { limit })?
+            match receiver.recv_timeout(limit) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Error::Timeout { limit }),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Error::message(
+                    "task worker stopped without returning a result",
+                )),
+            }
         })
     }
 }

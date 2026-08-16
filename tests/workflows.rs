@@ -182,6 +182,7 @@ fn supports_loops_globs_functions_parallelism_and_redirection() {
         "diagnostic"
     );
     assert_eq!(report.commands_run, 2);
+    assert_eq!(report.files_changed, 8);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -337,7 +338,7 @@ fn spawn_failure_terminates_already_started_pipeline_children() {
     let root = sandbox("spawn-cleanup");
     let marker = root.join("should-not-exist");
     let command = format!(
-        "$ sh -c \"i=0; while [ \\$i -lt 200000 ]; do i=\\$((i+1)); done; touch {}\" | shrimp-definitely-missing-command\n",
+        "$ sh -c \"sleep .1; touch {}\" | shrimp-definitely-missing-command\n",
         marker.display()
     );
     assert!(
@@ -349,4 +350,46 @@ fn spawn_failure_terminates_already_started_pipeline_children() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(!marker.exists());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn timed_pipeline_does_not_attribute_final_stderr_to_an_intermediate_failure() {
+    let error = cmd("sh")
+        .args(["-c", "printf intermediate-error >&2; exit 7"])
+        .pipe(cmd("sh").args(["-c", "cat; printf final-error >&2"]))
+        .run_timeout(&Context::default(), Duration::from_secs(1))
+        .unwrap_err();
+    match error {
+        Error::CommandFailed { status, stderr, .. } => {
+            assert_eq!(status.code(), Some(7));
+            assert!(stderr.is_empty(), "{stderr:?}");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn interpolation_does_not_implicitly_read_the_process_environment() {
+    let error = shrimp::Script::parse("print \"${PATH}\"\n")
+        .unwrap()
+        .run(&Context::new("."))
+        .unwrap_err();
+    assert!(error.to_string().contains("undefined variable `PATH`"));
+}
+
+#[test]
+fn recursive_functions_stop_at_the_call_depth_limit() {
+    let script = shrimp::Script::parse("fn recurse\n  call recurse\nend\ncall recurse\n").unwrap();
+    let error = script.run(&Context::default()).unwrap_err();
+    assert!(error.to_string().contains("function call depth exceeded"));
+}
+
+#[test]
+fn worker_panic_is_not_reported_as_a_timeout() {
+    let task =
+        Task::<()>::new(|_| panic!("intentional worker panic")).timeout(Duration::from_secs(1));
+    let error = task.run(&Context::default()).unwrap_err();
+    assert!(!matches!(error, Error::Timeout { .. }));
+    assert!(error.to_string().contains("worker stopped"));
 }

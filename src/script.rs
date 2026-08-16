@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 
+const MAX_FUNCTION_CALL_DEPTH: usize = 64;
+
 #[derive(Clone, Debug)]
 pub struct Script {
     statements: Vec<Statement>,
@@ -148,6 +150,7 @@ impl Script {
             variables,
             secrets: HashSet::new(),
             functions: HashMap::new(),
+            call_depth: 0,
             options,
             report: ScriptReport::default(),
         };
@@ -162,6 +165,7 @@ struct Runtime {
     variables: HashMap<String, String>,
     secrets: HashSet<String>,
     functions: HashMap<String, (Vec<String>, Vec<Statement>)>,
+    call_depth: usize,
     options: ScriptOptions,
     report: ScriptReport,
 }
@@ -293,7 +297,7 @@ impl Runtime {
                         file.write_all(value.as_bytes())
                             .map_err(|e| Error::io("append", Some(path), e))?;
                     } else {
-                        files::write_atomic(path, value).run(&Context::new("/"))?;
+                        files::write_atomic(path, value).run(&self.context)?;
                     }
                     self.report.files_changed += 1;
                 }
@@ -440,6 +444,11 @@ impl Runtime {
     }
 
     fn call(&mut self, name: &str, arguments: &str) -> Result<()> {
+        if self.call_depth >= MAX_FUNCTION_CALL_DEPTH {
+            return Err(Error::message(format!(
+                "function call depth exceeded the limit of {MAX_FUNCTION_CALL_DEPTH}"
+            )));
+        }
         let (parameters, body) = self
             .functions
             .get(name)
@@ -457,7 +466,9 @@ impl Runtime {
         for (parameter, argument) in parameters.into_iter().zip(arguments) {
             self.variables.insert(parameter, argument);
         }
+        self.call_depth += 1;
         let result = self.execute(&body);
+        self.call_depth -= 1;
         self.variables = saved;
         result
     }
@@ -1029,7 +1040,6 @@ fn words(source: &str, variables: &HashMap<String, String>) -> Result<Vec<String
                 let value = variables
                     .get(&name)
                     .cloned()
-                    .or_else(|| std::env::var(&name).ok())
                     .ok_or_else(|| Error::message(format!("undefined variable `{name}`")))?;
                 word.push_str(&value)
             }
