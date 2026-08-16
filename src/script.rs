@@ -345,7 +345,18 @@ impl Runtime {
                 let path = resolve(self.context.cwd(), &path);
                 self.trace(&format!("remove --recursive --force {}", path.display()));
                 if !self.options.dry_run {
-                    let result = if path.is_dir() {
+                    let metadata = match std::fs::symlink_metadata(&path) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                        Err(error) => {
+                            return Err(Error::io(
+                                "inspect for recursive removal",
+                                Some(path),
+                                error,
+                            ));
+                        }
+                    };
+                    let result = if metadata.file_type().is_dir() {
                         std::fs::remove_dir_all(&path)
                     } else {
                         std::fs::remove_file(&path)

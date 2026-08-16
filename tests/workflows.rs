@@ -340,6 +340,22 @@ fn recursive_remove_rejects_an_empty_path() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn recursive_remove_removes_a_dangling_symlink() {
+    let root = sandbox("dangling-recursive-remove");
+    let link = root.join("stale-link");
+    std::os::unix::fs::symlink(root.join("missing-target"), &link).unwrap();
+
+    shrimp::Script::parse("remove --recursive --force \"stale-link\"\n")
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+
+    assert!(std::fs::symlink_metadata(&link).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn bounded_parallel_for_runs_every_iteration() {
     let root = sandbox("parallel-for");
