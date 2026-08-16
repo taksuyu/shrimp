@@ -326,6 +326,21 @@ fn record_field_count_errors_are_line_aware() {
 }
 
 #[test]
+fn recursive_remove_rejects_an_empty_path() {
+    let root = sandbox("empty-recursive-remove");
+    let marker = root.join("must-remain");
+    std::fs::write(&marker, "safe").unwrap();
+    let error = shrimp::Script::parse("remove --recursive --force \"\"\n")
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("remove path must not be empty"));
+    assert!(marker.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn bounded_parallel_for_runs_every_iteration() {
     let root = sandbox("parallel-for");
     let source = r#"

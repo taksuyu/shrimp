@@ -4,11 +4,11 @@ SHELL := /usr/bin/env bash
 SHRIMP := ../../target/debug/shrimp
 WORK := .work
 
-.PHONY: all bash nu shrimp compare repeatability clean
+.PHONY: all bash nu shrimp cargo-build compare repeatability clean
 
 all: compare
 
-$(SHRIMP): ../../src/script.rs ../../src/main.rs ../../src/lib.rs ../../Cargo.toml
+cargo-build:
 	cargo build --manifest-path ../../Cargo.toml
 
 bash:
@@ -17,7 +17,7 @@ bash:
 nu:
 	nu ./build.nu "$(WORK)/nu"
 
-shrimp: $(SHRIMP)
+shrimp: cargo-build
 	$(SHRIMP) ./build.shrimp OUT="$(WORK)/shrimp"
 
 compare: clean bash nu shrimp
@@ -33,4 +33,3 @@ repeatability: clean bash nu shrimp
 
 clean:
 	rm -rf "$(WORK)" "$(WORK).first"
-

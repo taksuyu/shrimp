@@ -338,16 +338,25 @@ impl Runtime {
                 }
             }
             StatementKind::RemoveTree(path) => {
-                let path = resolve(self.context.cwd(), &self.expand_single(path)?);
+                let path = self.expand_single(path)?;
+                if path.is_empty() {
+                    return Err(Error::message("remove path must not be empty"));
+                }
+                let path = resolve(self.context.cwd(), &path);
                 self.trace(&format!("remove --recursive --force {}", path.display()));
-                if !self.options.dry_run && path.exists() {
-                    if path.is_dir() {
+                if !self.options.dry_run {
+                    let result = if path.is_dir() {
                         std::fs::remove_dir_all(&path)
                     } else {
                         std::fs::remove_file(&path)
+                    };
+                    match result {
+                        Ok(()) => self.report.files_changed += 1,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(Error::io("remove recursively", Some(path), error));
+                        }
                     }
-                    .map_err(|e| Error::io("remove recursively", Some(path), e))?;
-                    self.report.files_changed += 1;
                 }
             }
             StatementKind::Record {
