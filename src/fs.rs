@@ -69,10 +69,38 @@ pub fn write_atomic(path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> T
             &temp,
             std::fs::write(&temp, &contents),
         )?;
-        if let Err(source) = std::fs::rename(&temp, &path) {
+        if let Err(source) = atomic_replace(&temp, &path) {
             let _ = std::fs::remove_file(&temp);
             return Err(Error::io("rename temporary file", Some(path), source));
         }
         Ok(())
     })
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let succeeded = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if succeeded == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }

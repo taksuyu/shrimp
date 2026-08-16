@@ -234,3 +234,119 @@ fn trace_redacts_secret_values() {
     assert!(!trace.contains("top-secret-value"), "{trace}");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn timeout_applies_while_descendants_hold_output_pipes() {
+    let started = std::time::Instant::now();
+    let error = shrimp::Script::parse("timeout 20ms $ sh -c \"sleep 2 &\"\n")
+        .unwrap()
+        .run(&Context::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeded timeout"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn parallel_waits_for_all_branches_before_reporting_failure() {
+    let root = sandbox("parallel-failure");
+    let script = shrimp::Script::parse(
+        "parallel\n  $ sh -c \"exit 9\"\n  $ sh -c \"sleep .1; touch completed\"\nend\n",
+    )
+    .unwrap();
+    assert!(script.run(&Context::new(&root)).is_err());
+    assert!(root.join("completed").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dry_run_parallel_branches_keep_isolated_variables() {
+    let script = shrimp::Script::parse(
+        "parallel\n  let branch_only = value\n  print \"${branch_only}\"\nend\n",
+    )
+    .unwrap();
+    let error = script
+        .run_with_options(
+            &Context::default(),
+            shrimp::ScriptOptions {
+                dry_run: true,
+                trace: false,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("undefined variable `branch_only`")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn redirection_scanner_accepts_utf8_before_operator() {
+    let root = sandbox("utf8-redirection");
+    shrimp::Script::parse("$ printf café > output.txt\n")
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("output.txt")).unwrap(),
+        "café"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn file_operators_inside_quotes_are_not_delimiters() {
+    let root = sandbox("quoted-operators");
+    let script = shrimp::Script::parse(
+        "write \"result<-old\" <- first\ncopy \"result<-old\" -> \"copy->name\"\nappend \"copy->name\" <- second\n",
+    )
+    .unwrap();
+    script.run(&Context::new(&root)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result<-old")).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("copy->name")).unwrap(),
+        "firstsecond"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn atomic_write_replaces_an_existing_file() {
+    let root = sandbox("atomic-replace");
+    let context = Context::new(&root);
+    files::write_atomic("value", "first").run(&context).unwrap();
+    files::write_atomic("value", "second")
+        .run(&context)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("value")).unwrap(),
+        "second"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_failure_terminates_already_started_pipeline_children() {
+    let root = sandbox("spawn-cleanup");
+    let marker = root.join("should-not-exist");
+    let command = format!(
+        "$ sh -c \"i=0; while [ \\$i -lt 200000 ]; do i=\\$((i+1)); done; touch {}\" | shrimp-definitely-missing-command\n",
+        marker.display()
+    );
+    assert!(
+        shrimp::Script::parse(&command)
+            .unwrap()
+            .run(&Context::new(&root))
+            .is_err()
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}

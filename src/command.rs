@@ -5,6 +5,7 @@ use std::{
     io::Read,
     path::PathBuf,
     process::{Command, ExitStatus, Stdio},
+    sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
@@ -73,7 +74,7 @@ impl Cmd {
         .run_unchecked(context)
     }
 
-    fn command(&self, context: &Context, isolated: bool) -> Command {
+    fn command(&self, context: &Context, _isolated: bool) -> Command {
         let mut command = Command::new(&self.program);
         command
             .args(&self.args)
@@ -84,7 +85,7 @@ impl Cmd {
         // Give each command its own process group so timeouts can also terminate
         // grandchildren (for example `sh -c "sleep 30"`) rather than leaking them.
         #[cfg(unix)]
-        if isolated {
+        if _isolated {
             use std::os::unix::process::CommandExt;
             unsafe {
                 command.pre_exec(|| {
@@ -191,7 +192,7 @@ impl Pipeline {
                 Ok(child) => child,
                 Err(error) => {
                     for (_, child, _) in &mut children {
-                        let _ = child.kill();
+                        kill_process_tree(child);
                         let _ = child.wait();
                     }
                     return Err(Error::io("spawn command", None, error));
@@ -206,8 +207,10 @@ impl Pipeline {
             children.push((specification.to_string(), child, None));
         }
 
-        let stdout_reader = thread::spawn(move || read_all(final_stdout));
-        let stderr_reader = thread::spawn(move || read_all(final_stderr));
+        let stdout_reader = spawn_reader(final_stdout);
+        let stderr_reader = spawn_reader(final_stderr);
+        let mut stdout = None;
+        let mut stderr = None;
         let started = Instant::now();
         loop {
             let mut running = false;
@@ -219,7 +222,9 @@ impl Pipeline {
                     running |= status.is_none();
                 }
             }
-            if !running {
+            poll_reader(&stdout_reader, &mut stdout)?;
+            poll_reader(&stderr_reader, &mut stderr)?;
+            if !running && stdout.is_some() && stderr.is_some() {
                 break;
             }
             if started.elapsed() >= limit {
@@ -227,18 +232,12 @@ impl Pipeline {
                     kill_process_tree(child);
                     let _ = child.wait();
                 }
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
                 return Err(Error::Timeout { limit });
             }
             thread::sleep(Duration::from_millis(5));
         }
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| Error::message("stdout reader panicked"))??;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| Error::message("stderr reader panicked"))??;
+        let stdout = stdout.expect("completed stdout reader");
+        let stderr = stderr.expect("completed stderr reader");
         let final_status = children
             .last()
             .and_then(|(_, _, status)| *status)
@@ -264,7 +263,8 @@ impl Pipeline {
         if self.commands.is_empty() {
             return Err(Error::EmptyPipeline);
         }
-        let mut children = Vec::with_capacity(self.commands.len());
+        let mut children: Vec<(String, std::process::Child)> =
+            Vec::with_capacity(self.commands.len());
         let mut previous_stdout = None;
         for (index, specification) in self.commands.iter().enumerate() {
             let last = index + 1 == self.commands.len();
@@ -282,9 +282,16 @@ impl Pipeline {
             } else {
                 Stdio::inherit()
             });
-            let mut child = command
-                .spawn()
-                .map_err(|e| Error::io("spawn command", None, e))?;
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    for (_, child) in &mut children {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    return Err(Error::io("spawn command", None, error));
+                }
+            };
             if !last {
                 previous_stdout = child.stdout.take();
             }
@@ -334,6 +341,28 @@ fn read_all<R: Read>(reader: Option<R>) -> Result<Vec<u8>> {
             .map_err(|e| Error::io("read command output", None, e))?;
     }
     Ok(output)
+}
+
+fn spawn_reader<R: Read + Send + 'static>(reader: Option<R>) -> Receiver<Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(read_all(reader));
+    });
+    receiver
+}
+
+fn poll_reader(receiver: &Receiver<Result<Vec<u8>>>, output: &mut Option<Vec<u8>>) -> Result<()> {
+    if output.is_some() {
+        return Ok(());
+    }
+    match receiver.try_recv() {
+        Ok(result) => *output = Some(result?),
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            return Err(Error::message("command output reader stopped unexpectedly"));
+        }
+    }
+    Ok(())
 }
 
 fn kill_process_tree(child: &mut std::process::Child) {

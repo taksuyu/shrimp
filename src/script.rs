@@ -393,10 +393,17 @@ impl Runtime {
     fn parallel(&mut self, branches: &[Statement]) -> Result<()> {
         self.trace(&format!("parallel {} branches", branches.len()));
         if self.options.dry_run {
+            let mut first_error = None;
             for branch in branches {
-                self.execute(std::slice::from_ref(branch))?;
+                let mut runtime = self.clone();
+                runtime.report = ScriptReport::default();
+                if let Err(error) = runtime.execute(std::slice::from_ref(branch))
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
             }
-            return Ok(());
+            return first_error.map_or(Ok(()), Err);
         }
         let handles: Vec<_> = branches
             .iter()
@@ -410,14 +417,26 @@ impl Runtime {
                 })
             })
             .collect();
+        let mut first_error = None;
         for handle in handles {
-            let report = handle
-                .join()
-                .map_err(|_| Error::message("parallel branch panicked"))??;
-            self.report.commands_run += report.commands_run;
-            self.report.files_changed += report.files_changed;
+            match handle.join() {
+                Ok(Ok(report)) => {
+                    self.report.commands_run += report.commands_run;
+                    self.report.files_changed += report.files_changed;
+                }
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(Error::message("parallel branch panicked"));
+                    }
+                }
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     fn call(&mut self, name: &str, arguments: &str) -> Result<()> {
@@ -727,7 +746,7 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
     } else if let Some(rest) = text.strip_prefix("secret ") {
         assignment(rest, true)?
     } else if let Some(rest) = text.strip_prefix("capture ") {
-        let (name, command) = split_once(rest, "<-")?;
+        let (name, command) = split_operator(rest, "<-")?;
         valid_name(name)?;
         StatementKind::Capture {
             name: name.into(),
@@ -758,21 +777,21 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
     } else if let Some(v) = text.strip_prefix("mkdir ") {
         StatementKind::Mkdir(v.into())
     } else if let Some(rest) = text.strip_prefix("write ") {
-        let (path, value) = split_once(rest, "<-")?;
+        let (path, value) = split_operator(rest, "<-")?;
         StatementKind::Write {
             path: path.into(),
             value: value.into(),
             append: false,
         }
     } else if let Some(rest) = text.strip_prefix("append ") {
-        let (path, value) = split_once(rest, "<-")?;
+        let (path, value) = split_operator(rest, "<-")?;
         StatementKind::Write {
             path: path.into(),
             value: value.into(),
             append: true,
         }
     } else if let Some(rest) = text.strip_prefix("copy ") {
-        let (from, to) = split_once(rest, "->")?;
+        let (from, to) = split_operator(rest, "->")?;
         StatementKind::Copy {
             from: from.into(),
             to: to.into(),
@@ -796,7 +815,7 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
     Ok(Statement { line, kind })
 }
 fn assignment(rest: &str, secret: bool) -> Result<StatementKind> {
-    let (name, value) = split_once(rest, "=")?;
+    let (name, value) = split_operator(rest, "=")?;
     valid_name(name)?;
     Ok(StatementKind::Let {
         name: name.into(),
@@ -818,11 +837,34 @@ fn parse_duration(value: &str) -> Result<Duration> {
         _ => Err(Error::message("duration needs ms, s, or m suffix")),
     }
 }
-fn split_once<'a>(value: &'a str, delimiter: &str) -> Result<(&'a str, &'a str)> {
-    value
-        .split_once(delimiter)
-        .map(|(a, b)| (a.trim(), b.trim()))
-        .ok_or_else(|| Error::message(format!("expected `{delimiter}`")))
+fn split_operator<'a>(value: &'a str, delimiter: &str) -> Result<(&'a str, &'a str)> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '\'' || character == '"' {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+            continue;
+        }
+        if quote.is_none() && value[index..].starts_with(delimiter) {
+            return Ok((
+                value[..index].trim(),
+                value[index + delimiter.len()..].trim(),
+            ));
+        }
+    }
+    Err(Error::message(format!("expected `{delimiter}`")))
 }
 fn valid_name(name: &str) -> Result<()> {
     if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -835,52 +877,40 @@ fn valid_name(name: &str) -> Result<()> {
 fn extract_redirect(line: &str) -> Result<(&str, Option<(RedirectKind, &str)>)> {
     let mut quote = None;
     let mut escaped = false;
-    let bytes = line.as_bytes();
     let mut found = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    let mut characters = line.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
         if escaped {
             escaped = false;
-            i += 1;
             continue;
         }
-        if c == '\\' {
+        if character == '\\' {
             escaped = true;
-            i += 1;
             continue;
         }
-        if c == '\'' || c == '"' {
-            if quote == Some(c) {
+        if character == '\'' || character == '"' {
+            if quote == Some(character) {
                 quote = None
             } else if quote.is_none() {
-                quote = Some(c)
+                quote = Some(character)
             };
-            i += 1;
             continue;
         }
         if quote.is_none() {
-            let (kind, len) = if line[i..].starts_with(">>") {
-                (Some(RedirectKind::Append), 2)
-            } else if line[i..].starts_with("2>") {
+            let next = characters.peek().map(|(_, next)| *next);
+            let (kind, len) = if character == '2' && next == Some('>') {
                 (Some(RedirectKind::Stderr), 2)
-            } else if c == '>' {
+            } else if character == '>' && next == Some('>') {
+                (Some(RedirectKind::Append), 2)
+            } else if character == '>' {
                 (Some(RedirectKind::Stdout), 1)
             } else {
-                (None, 1)
+                (None, 0)
             };
             if let Some(kind) = kind {
-                if found.is_some() {
-                    return Err(Error::message(
-                        "only one redirection is supported per command",
-                    ));
-                }
-                found = Some((i, kind, len));
+                found = Some((index, kind, len));
                 break;
             }
-            i += len
-        } else {
-            i += 1
         }
     }
     if let Some((index, kind, len)) = found {
