@@ -283,6 +283,125 @@ fn dry_run_parallel_branches_keep_isolated_variables() {
     );
 }
 
+#[test]
+fn records_match_fields_and_recursive_remove_cleans_trees() {
+    let root = sandbox("records-match-remove");
+    std::fs::create_dir_all(root.join("stale/nested")).unwrap();
+    std::fs::write(root.join("stale/nested/file"), "old").unwrap();
+    let source = r#"
+        record document tsv "guide\tpublished\tdocs/guide.md" fields name state path
+        match "${document.state}"
+        case published
+          write "result.txt" <- "${document.name}:${document.path}"
+        case draft
+          write "result.txt" <- "draft"
+        else
+          write "result.txt" <- "unknown"
+        end
+        remove --recursive --force "stale"
+        remove --recursive --force "already-absent"
+    "#;
+    let report = shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("result.txt")).unwrap(),
+        "guide:docs/guide.md"
+    );
+    assert!(!root.join("stale").exists());
+    assert_eq!(report.files_changed, 2);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn record_field_count_errors_are_line_aware() {
+    let error = shrimp::Script::parse("record row tsv \"one\\ttwo\" fields first second third\n")
+        .unwrap()
+        .run(&Context::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("script line 1"), "{error}");
+    assert!(error.to_string().contains("expects 3"), "{error}");
+}
+
+#[test]
+fn recursive_remove_rejects_an_empty_path() {
+    let root = sandbox("empty-recursive-remove");
+    let marker = root.join("must-remain");
+    std::fs::write(&marker, "safe").unwrap();
+    let error = shrimp::Script::parse("remove --recursive --force \"\"\n")
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("remove path must not be empty"));
+    assert!(marker.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn recursive_remove_removes_a_dangling_symlink() {
+    let root = sandbox("dangling-recursive-remove");
+    let link = root.join("stale-link");
+    std::os::unix::fs::symlink(root.join("missing-target"), &link).unwrap();
+
+    shrimp::Script::parse("remove --recursive --force \"stale-link\"\n")
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+
+    assert!(matches!(
+        std::fs::symlink_metadata(&link),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn bounded_parallel_for_runs_every_iteration() {
+    let root = sandbox("parallel-for");
+    let source = r#"
+        mkdir "output"
+        parallel for item in words "one two three four" limit 2
+          write "output/${item}" <- "${item}"
+        end
+    "#;
+    let report = shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    for item in ["one", "two", "three", "four"] {
+        assert_eq!(
+            std::fs::read_to_string(root.join("output").join(item)).unwrap(),
+            item
+        );
+    }
+    assert_eq!(report.files_changed, 5);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_parallel_for_does_not_multiply_the_outer_limit() {
+    let started = std::time::Instant::now();
+    let source = r#"
+        parallel for outer in words "one two" limit 2
+          parallel for inner in words "left right" limit 2
+            $ sh -c "sleep .1"
+          end
+        end
+    "#;
+    let report = shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::default())
+        .unwrap();
+
+    assert_eq!(report.commands_run, 4);
+    assert!(started.elapsed() >= Duration::from_millis(180));
+}
+
 #[cfg(unix)]
 #[test]
 fn redirection_scanner_accepts_utf8_before_operator() {

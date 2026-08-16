@@ -165,15 +165,17 @@ Implemented now:
 - conditionals and retries;
 - explicit working directories and child environments;
 - atomic writes, append, copy, remove, and directory creation;
-- comments, quoting, escapes, continuation, and line-aware diagnostics.
+- comments, quoting, escapes, continuation, and line-aware diagnostics;
 - glob/line/word iteration and reusable functions;
 - parallel workflow branches;
 - stdout/stderr redirection and cancellable command timeouts;
-- secret-aware tracing and side-effect-free dry runs.
+- secret-aware tracing and side-effect-free dry runs;
+- TSV records with named field access and string `match` branches;
+- recursive workspace removal and concurrency-bounded parallel loops.
 
 The initial language contract is documented in [`docs/language.md`](docs/language.md).
-Remaining production-hardening work includes Windows job-object cancellation, bounded
-parallelism, richer typed values, explicit stdin redirection, file durability policy,
+Remaining production-hardening work includes Windows job-object cancellation, richer
+typed values beyond TSV records, explicit stdin redirection, file durability policy,
 and a compatibility/versioning policy once the syntax has had real-world use.
 
 ## Rust embedding API
@@ -189,3 +191,8 @@ for the language rather than the primary user experience.
 cargo run -- examples/ci.shrimp
 cat target/shrimp-example/build.txt
 ```
+
+For a more demanding side-by-side exercise, the
+[`examples/workspace-comparison`](examples/workspace-comparison/README.md) benchmark
+implements the same document-driven workspace build in Bash, Nushell, and Shrimp and
+uses a Makefile to compare their outputs and repeatability.
