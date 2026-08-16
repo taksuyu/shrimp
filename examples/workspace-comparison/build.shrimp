@@ -1,0 +1,41 @@
+# OUT may be supplied by the Makefile or on the command line.
+fn build_document row
+  record document tsv "${row}" fields name state source
+
+  if test -f "${document.source}"
+    print "building ${document.name}"
+  else
+    print "missing document: ${document.source}"
+    $ false
+  end
+
+  match "${document.state}"
+  case published
+    let destination = "published/${document.name}.md"
+  case draft
+    let destination = "drafts/${document.name}.md"
+  else
+    print "invalid state for ${document.name}: ${document.state}"
+    $ false
+  end
+  copy "${document.source}" -> "${OUT}/${destination}"
+  capture digest <- sha256sum "${document.source}" | cut -d " " -f 1
+  write "${OUT}/entries/${document.name}.tsv" <- "${document.name}\t${document.state}\t${destination}\t${digest}\n"
+end
+
+remove --recursive --force "${OUT}"
+mkdir "${OUT}"
+mkdir "${OUT}/published"
+mkdir "${OUT}/drafts"
+mkdir "${OUT}/entries"
+
+capture workspace <- cat workspace.tsv
+parallel for row in lines "${workspace}" limit 2
+  call build_document "${row}"
+end
+for row in lines "${workspace}"
+  record document tsv "${row}" fields name state source
+  capture entry <- cat "${OUT}/entries/${document.name}.tsv"
+  append "${OUT}/index.tsv" <- "${entry}\n"
+end
+remove --recursive --force "${OUT}/entries"

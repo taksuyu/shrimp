@@ -69,11 +69,22 @@ enum StatementKind {
         to: String,
     },
     Remove(String),
+    RemoveTree(String),
+    Record {
+        name: String,
+        value: String,
+        fields: Vec<String>,
+    },
     Print(String),
     If {
         command: String,
         yes: Vec<Statement>,
         no: Vec<Statement>,
+    },
+    Match {
+        value: String,
+        cases: Vec<(String, Vec<Statement>)>,
+        fallback: Vec<Statement>,
     },
     For {
         name: String,
@@ -81,6 +92,12 @@ enum StatementKind {
         body: Vec<Statement>,
     },
     Parallel(Vec<Statement>),
+    ParallelFor {
+        name: String,
+        values: Values,
+        limit: usize,
+        body: Vec<Statement>,
+    },
     Function {
         name: String,
         parameters: Vec<String>,
@@ -103,6 +120,7 @@ enum Values {
 enum Ending {
     End,
     Else,
+    Case,
 }
 
 impl Script {
@@ -319,6 +337,38 @@ impl Runtime {
                     self.report.files_changed += 1;
                 }
             }
+            StatementKind::RemoveTree(path) => {
+                let path = resolve(self.context.cwd(), &self.expand_single(path)?);
+                self.trace(&format!("remove --recursive --force {}", path.display()));
+                if !self.options.dry_run && path.exists() {
+                    if path.is_dir() {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    }
+                    .map_err(|e| Error::io("remove recursively", Some(path), e))?;
+                    self.report.files_changed += 1;
+                }
+            }
+            StatementKind::Record {
+                name,
+                value,
+                fields,
+            } => {
+                let value = self.expand_single(value)?;
+                let parts: Vec<_> = value.split('\t').collect();
+                if parts.len() != fields.len() {
+                    return Err(Error::message(format!(
+                        "record `{name}` expects {} tab-separated fields, got {}",
+                        fields.len(),
+                        parts.len()
+                    )));
+                }
+                for (field, value) in fields.iter().zip(parts) {
+                    self.variables
+                        .insert(format!("{name}.{field}"), value.into());
+                }
+            }
             StatementKind::Print(value) => {
                 let value = self.expand_single(value)?;
                 self.trace(&format!("print {}", self.redact(value.clone())));
@@ -338,6 +388,21 @@ impl Runtime {
                 };
                 self.execute(if success { yes } else { no })?;
             }
+            StatementKind::Match {
+                value,
+                cases,
+                fallback,
+            } => {
+                let value = self.expand_single(value)?;
+                let mut body = fallback;
+                for (pattern, candidate) in cases {
+                    if self.expand_single(pattern)? == value {
+                        body = candidate;
+                        break;
+                    }
+                }
+                self.execute(body)?;
+            }
             StatementKind::For { name, values, body } => {
                 for value in self.values(values)? {
                     self.variables.insert(name.clone(), value);
@@ -346,6 +411,12 @@ impl Runtime {
                 self.variables.remove(name);
             }
             StatementKind::Parallel(branches) => self.parallel(branches)?,
+            StatementKind::ParallelFor {
+                name,
+                values,
+                limit,
+                body,
+            } => self.parallel_for(name, values, *limit, body)?,
             StatementKind::Function {
                 name,
                 parameters,
@@ -441,6 +512,71 @@ impl Runtime {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    fn parallel_for(
+        &mut self,
+        name: &str,
+        values: &Values,
+        limit: usize,
+        body: &[Statement],
+    ) -> Result<()> {
+        if limit == 0 {
+            return Err(Error::message("parallel limit must be greater than zero"));
+        }
+        let values = self.values(values)?;
+        self.trace(&format!(
+            "parallel for {} items (limit {limit})",
+            values.len()
+        ));
+        for batch in values.chunks(limit) {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|value| {
+                    let mut runtime = self.clone();
+                    runtime.variables.insert(name.into(), value.clone());
+                    runtime.report = ScriptReport::default();
+                    let body = body.to_vec();
+                    if self.options.dry_run {
+                        None
+                    } else {
+                        Some(thread::spawn(move || {
+                            runtime.execute(&body)?;
+                            Ok::<_, Error>(runtime.report)
+                        }))
+                    }
+                })
+                .collect();
+            if self.options.dry_run {
+                for value in batch {
+                    let mut runtime = self.clone();
+                    runtime.variables.insert(name.into(), value.clone());
+                    runtime.report = ScriptReport::default();
+                    runtime.execute(body)?;
+                }
+                continue;
+            }
+            let mut first_error = None;
+            for handle in handles.into_iter().flatten() {
+                match handle.join() {
+                    Ok(Ok(report)) => {
+                        self.report.commands_run += report.commands_run;
+                        self.report.files_changed += report.files_changed;
+                    }
+                    Ok(Err(error)) => {
+                        first_error.get_or_insert(error);
+                    }
+                    Err(_) => {
+                        first_error
+                            .get_or_insert_with(|| Error::message("parallel branch panicked"));
+                    }
+                };
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     fn call(&mut self, name: &str, arguments: &str) -> Result<()> {
@@ -665,8 +801,51 @@ fn parse_block(
                 Err(script_error(*line, "unexpected `else`"))
             };
         }
+        if text.starts_with("case ") {
+            return if nested {
+                Ok((statements, Some(Ending::Case)))
+            } else {
+                Err(script_error(*line, "unexpected `case`"))
+            };
+        }
         *position += 1;
-        let kind = if let Some(command) = text.strip_prefix("if ") {
+        let kind = if let Some(value) = text.strip_prefix("match ") {
+            let mut cases = Vec::new();
+            let mut fallback = Vec::new();
+            let (prefix, mut ending) = parse_block(lines, position, true)?;
+            if !prefix.is_empty() {
+                return Err(script_error(
+                    *line,
+                    "match statements must be inside a case",
+                ));
+            }
+            while ending == Some(Ending::Case) {
+                let (case_line, case_text) = &lines[*position];
+                let pattern = case_text
+                    .strip_prefix("case ")
+                    .ok_or_else(|| script_error(*case_line, "match case syntax: case VALUE"))?
+                    .to_owned();
+                *position += 1;
+                let (body, next) = parse_block(lines, position, true)?;
+                cases.push((pattern, body));
+                ending = next;
+            }
+            if ending == Some(Ending::Else) {
+                let (body, end) = parse_block(lines, position, true)?;
+                require_end(*line, end)?;
+                fallback = body;
+            } else {
+                require_end(*line, ending)?;
+            }
+            if cases.is_empty() {
+                return Err(script_error(*line, "match requires at least one case"));
+            }
+            StatementKind::Match {
+                value: value.into(),
+                cases,
+                fallback,
+            }
+        } else if let Some(command) = text.strip_prefix("if ") {
             let (yes, ending) = parse_block(lines, position, true)?;
             let no = if ending == Some(Ending::Else) {
                 let (body, end) = parse_block(lines, position, true)?;
@@ -703,6 +882,32 @@ fn parse_block(
             StatementKind::For {
                 name: name.into(),
                 values,
+                body,
+            }
+        } else if let Some(rest) = text.strip_prefix("parallel for ") {
+            let (loop_part, limit) = rest.rsplit_once(" limit ").ok_or_else(|| {
+                script_error(
+                    *line,
+                    "parallel for syntax: parallel for NAME in SOURCE VALUE limit COUNT",
+                )
+            })?;
+            let (name, source) = loop_part.split_once(" in ").ok_or_else(|| {
+                script_error(
+                    *line,
+                    "parallel for syntax: parallel for NAME in SOURCE VALUE limit COUNT",
+                )
+            })?;
+            valid_name(name)?;
+            let values = parse_values(*line, source)?;
+            let limit = limit
+                .parse()
+                .map_err(|_| script_error(*line, "invalid parallel limit"))?;
+            let (body, end) = parse_block(lines, position, true)?;
+            require_end(*line, end)?;
+            StatementKind::ParallelFor {
+                name: name.into(),
+                values,
+                limit,
                 body,
             }
         } else if text == "parallel" {
@@ -748,6 +953,18 @@ fn require_end(line: usize, ending: Option<Ending>) -> Result<()> {
         Ok(())
     } else {
         Err(script_error(line, "missing `end`"))
+    }
+}
+
+fn parse_values(line: usize, source: &str) -> Result<Values> {
+    if let Some(value) = source.strip_prefix("glob ") {
+        Ok(Values::Glob(value.into()))
+    } else if let Some(value) = source.strip_prefix("lines ") {
+        Ok(Values::Lines(value.into()))
+    } else if let Some(value) = source.strip_prefix("words ") {
+        Ok(Values::Words(value.into()))
+    } else {
+        Err(script_error(line, "source must be glob, lines, or words"))
     }
 }
 
@@ -808,7 +1025,41 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
             to: to.into(),
         }
     } else if let Some(v) = text.strip_prefix("remove ") {
-        StatementKind::Remove(v.into())
+        if let Some(path) = v.strip_prefix("--recursive --force ") {
+            StatementKind::RemoveTree(path.into())
+        } else {
+            StatementKind::Remove(v.into())
+        }
+    } else if let Some(rest) = text.strip_prefix("record ") {
+        let (definition, fields) = rest.split_once(" fields ").ok_or_else(|| {
+            script_error(line, "record syntax: record NAME tsv VALUE fields FIELD...")
+        })?;
+        let (name, value) = definition.split_once(" tsv ").ok_or_else(|| {
+            script_error(line, "record syntax: record NAME tsv VALUE fields FIELD...")
+        })?;
+        valid_name(name)?;
+        let pieces = fields
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if pieces.is_empty() {
+            return Err(script_error(line, "record requires at least one field"));
+        }
+        let mut unique = HashSet::new();
+        for field in &pieces {
+            valid_name(field)?;
+            if !unique.insert(field) {
+                return Err(script_error(
+                    line,
+                    format!("duplicate record field `{field}`"),
+                ));
+            }
+        }
+        StatementKind::Record {
+            name: name.into(),
+            value: value.into(),
+            fields: pieces,
+        }
     } else if let Some(v) = text.strip_prefix("print ") {
         StatementKind::Print(v.into())
     } else if let Some(rest) = text.strip_prefix("call ") {

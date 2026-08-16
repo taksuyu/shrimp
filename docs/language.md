@@ -26,6 +26,14 @@ Values are currently UTF-8 strings. `capture` removes trailing CR/LF characters.
 Undefined variables are errors. Secrets behave like ordinary values except that their
 contents are replaced with `[REDACTED]` in trace output.
 
+Tab-separated input can be named as a record. Field count and field names are
+validated, and fields are accessed with dotted interpolation:
+
+```shrimp
+record document tsv "${line}" fields name state path
+print "${document.name}: ${document.path}"
+```
+
 ## Processes
 
 ```shrimp
@@ -64,10 +72,29 @@ write "output/value" <- "complete contents\n"
 append "output/log" <- "one more line\n"
 copy "source" -> "destination"
 remove "obsolete"
+remove --recursive --force "generated-tree"
 ```
 
 `write` creates a same-directory temporary file and renames it over the destination.
 It does not create parent directories. `remove` fails for absent files.
+`remove --recursive --force` removes a file or directory tree and succeeds when the
+path is already absent, making it suitable for clean workspace builds.
+
+## Matching
+
+`match` selects a branch by string value. An optional `else` handles values without a
+matching case:
+
+```shrimp
+match "${document.state}"
+case published
+  print "ready"
+case draft
+  print "not ready"
+else
+  $ false
+end
+```
 
 ## Iteration
 
@@ -116,6 +143,18 @@ Every direct child statement is a branch and all branches start before Shrimp wa
 for them. Branches receive cloned variables, functions, context, and secret metadata;
 variable changes do not merge. Reports and external effects do merge. Concurrently
 writing the same path is intentionally the workflow author's responsibility.
+
+A loop can also run with an explicit concurrency bound:
+
+```shrimp
+parallel for file in glob "src/**/*.rs" limit 4
+  call check "${file}"
+end
+```
+
+At most `limit` iterations run concurrently. Each iteration receives isolated
+variables, just like a branch in `parallel`, and Shrimp waits for every iteration in a
+started batch before reporting an error.
 
 ## Runner
 
