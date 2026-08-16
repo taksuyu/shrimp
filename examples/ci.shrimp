@@ -1,0 +1,17 @@
+# A complete native workflow—not Rust source and not a shell script.
+let out = "../target/shrimp-example"
+mkdir "${out}"
+
+$ cargo fmt --manifest-path ../Cargo.toml -- --check
+$ cargo test --manifest-path ../Cargo.toml
+
+capture revision <- git rev-parse --short HEAD
+write "${out}/build.txt" <- "revision=${revision}\n"
+
+if git diff --quiet
+  append "${out}/build.txt" <- "tree=clean\n"
+else
+  append "${out}/build.txt" <- "tree=dirty\n"
+end
+
+print "wrote ${out}/build.txt"

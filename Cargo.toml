@@ -1,0 +1,19 @@
+[package]
+name = "shrimp"
+version = "0.1.0"
+edition = "2024"
+description = "A small, portable experiment in typed, composable shell scripting"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "shrimp"
+path = "src/main.rs"
+
+[dependencies]
+glob = "0.3.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
