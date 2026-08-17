@@ -6,11 +6,44 @@ use std::{
     collections::{HashMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::Duration,
 };
 
+/// The intentionally small set of values understood by workflow code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Value {
+    String(String),
+    Boolean(bool),
+    Integer(i64),
+    List(Vec<Value>),
+    Record(HashMap<String, Value>),
+    Missing,
+}
+
+impl Value {
+    fn scalar(&self) -> Result<String> {
+        match self {
+            Self::String(value) => Ok(value.clone()),
+            Self::Boolean(value) => Ok(value.to_string()),
+            Self::Integer(value) => Ok(value.to_string()),
+            Self::Missing => Err(Error::message("missing value cannot be interpolated")),
+            Self::List(_) => Err(Error::message(
+                "list cannot be interpolated; index or iterate it",
+            )),
+            Self::Record(_) => Err(Error::message(
+                "record cannot be interpolated; select a field",
+            )),
+        }
+    }
+}
+
 const MAX_FUNCTION_CALL_DEPTH: usize = 64;
+static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct Script {
@@ -104,9 +137,21 @@ enum StatementKind {
         body: Vec<Statement>,
     },
     Call {
+        target: Option<String>,
         name: String,
         arguments: String,
     },
+    Value(String),
+    Temp {
+        name: String,
+        directory: bool,
+    },
+    Metadata {
+        name: String,
+        path: String,
+        modified: bool,
+    },
+    Include(String),
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +159,7 @@ enum Values {
     Glob(String),
     Lines(String),
     Words(String),
+    Variable(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,7 +205,7 @@ impl Script {
             .map(|(key, value)| {
                 (
                     key.to_string_lossy().into_owned(),
-                    value.to_string_lossy().into_owned(),
+                    Value::String(value.to_string_lossy().into_owned()),
                 )
             })
             .collect();
@@ -172,22 +218,35 @@ impl Script {
             parallel_depth: 0,
             options,
             report: ScriptReport::default(),
+            source_dirs: vec![context.cwd().to_owned()],
+            loaded_includes: HashSet::new(),
+            active_includes: HashSet::new(),
+            last_value: Value::Missing,
+            temporary_paths: Arc::new(Mutex::new(Vec::new())),
         };
-        runtime.execute(&self.statements)?;
-        Ok(runtime.report)
+        let result = runtime
+            .execute(&self.statements)
+            .map(|()| runtime.report.clone());
+        runtime.cleanup_temporaries();
+        result
     }
 }
 
 #[derive(Clone)]
 struct Runtime {
     context: Context,
-    variables: HashMap<String, String>,
+    variables: HashMap<String, Value>,
     secrets: HashSet<String>,
     functions: HashMap<String, (Vec<String>, Vec<Statement>)>,
     call_depth: usize,
     parallel_depth: usize,
     options: ScriptOptions,
     report: ScriptReport,
+    source_dirs: Vec<PathBuf>,
+    loaded_includes: HashSet<PathBuf>,
+    active_includes: HashSet<PathBuf>,
+    last_value: Value,
+    temporary_paths: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl Runtime {
@@ -200,14 +259,16 @@ impl Runtime {
     }
 
     fn execute_one(&mut self, statement: &Statement) -> Result<()> {
+        self.last_value = Value::Missing;
         match &statement.kind {
             StatementKind::Let {
                 name,
                 value,
                 secret,
             } => {
-                let value = self.expand_single(value)?;
+                let value = self.eval_value(value)?;
                 self.variables.insert(name.clone(), value);
+                self.last_value = self.variables[name].clone();
                 if *secret {
                     self.secrets.insert(name.clone());
                 }
@@ -215,7 +276,8 @@ impl Runtime {
             StatementKind::Capture { name, command } => {
                 self.trace_command("capture", command)?;
                 if self.options.dry_run {
-                    self.variables.insert(name.clone(), String::new());
+                    self.variables
+                        .insert(name.clone(), Value::String(String::new()));
                 } else {
                     let invocation = self.invocation(command)?;
                     if invocation.redirect.is_some() {
@@ -227,12 +289,15 @@ impl Runtime {
                     self.report.commands_run += 1;
                     self.variables.insert(
                         name.clone(),
-                        output
-                            .stdout_string()?
-                            .trim_end_matches(['\r', '\n'])
-                            .to_owned(),
+                        Value::String(
+                            output
+                                .stdout_string()?
+                                .trim_end_matches(['\r', '\n'])
+                                .to_owned(),
+                        ),
                     );
                 }
+                self.last_value = self.variables[name].clone();
             }
             StatementKind::Run(command) => {
                 self.trace_command("run", command)?;
@@ -241,7 +306,7 @@ impl Runtime {
                     let output = invocation.pipeline.run(&self.context)?;
                     self.report.commands_run += 1;
                     invocation.finish(output, &self.context)?;
-                    self.report.files_changed += usize::from(invocation.redirect.is_some());
+                    self.report.files_changed += usize::from(invocation.changes_file());
                 }
             }
             StatementKind::Retry { attempts, command } => {
@@ -257,8 +322,7 @@ impl Runtime {
                         match invocation.pipeline.run(&self.context) {
                             Ok(output) => {
                                 invocation.finish(output, &self.context)?;
-                                self.report.files_changed +=
-                                    usize::from(invocation.redirect.is_some());
+                                self.report.files_changed += usize::from(invocation.changes_file());
                                 return Ok(());
                             }
                             Err(error) => {
@@ -279,7 +343,7 @@ impl Runtime {
                     let output = invocation.pipeline.run_timeout(&self.context, *duration)?;
                     self.report.commands_run += 1;
                     invocation.finish(output, &self.context)?;
-                    self.report.files_changed += usize::from(invocation.redirect.is_some());
+                    self.report.files_changed += usize::from(invocation.changes_file());
                 }
             }
             StatementKind::Cd(path) => {
@@ -308,6 +372,11 @@ impl Runtime {
                     path.display()
                 ));
                 if !self.options.dry_run {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            Error::io("create parent directories", Some(parent.into()), e)
+                        })?;
+                    }
                     if *append {
                         let mut file = std::fs::OpenOptions::new()
                             .create(true)
@@ -386,10 +455,14 @@ impl Runtime {
                         parts.len()
                     )));
                 }
-                for (field, value) in fields.iter().zip(parts) {
-                    self.variables
-                        .insert(format!("{name}.{field}"), value.into());
-                }
+                let record = fields
+                    .iter()
+                    .zip(parts)
+                    .map(|(field, value)| (field.clone(), Value::String(value.into())))
+                    .collect();
+                let value = Value::Record(record);
+                self.variables.insert(name.clone(), value.clone());
+                self.last_value = value;
             }
             StatementKind::Print(value) => {
                 let value = self.expand_single(value)?;
@@ -399,8 +472,15 @@ impl Runtime {
                 }
             }
             StatementKind::If { command, yes, no } => {
-                self.trace_command("if", command)?;
-                let success = if self.options.dry_run {
+                let expression = is_expression(command);
+                if expression {
+                    self.trace(&format!("if {command}"));
+                } else {
+                    self.trace_command("if", command)?;
+                }
+                let success = if expression {
+                    self.condition(command)?
+                } else if self.options.dry_run {
                     true
                 } else {
                     self.report.commands_run += 1;
@@ -427,7 +507,7 @@ impl Runtime {
             }
             StatementKind::For { name, values, body } => {
                 for value in self.values(values)? {
-                    self.variables.insert(name.clone(), value);
+                    self.variables.insert(name.clone(), Value::String(value));
                     self.execute(body)?;
                 }
                 self.variables.remove(name);
@@ -447,7 +527,25 @@ impl Runtime {
                 self.functions
                     .insert(name.clone(), (parameters.clone(), body.clone()));
             }
-            StatementKind::Call { name, arguments } => self.call(name, arguments)?,
+            StatementKind::Call {
+                target,
+                name,
+                arguments,
+            } => {
+                let value = self.call(name, arguments)?;
+                if let Some(target) = target {
+                    self.variables.insert(target.clone(), value.clone());
+                }
+                self.last_value = value;
+            }
+            StatementKind::Include(path) => self.include(path)?,
+            StatementKind::Value(source) => self.last_value = self.eval_value(source)?,
+            StatementKind::Temp { name, directory } => self.create_temporary(name, *directory)?,
+            StatementKind::Metadata {
+                name,
+                path,
+                modified,
+            } => self.metadata(name, path, *modified)?,
         }
         Ok(())
     }
@@ -484,6 +582,10 @@ impl Runtime {
                     })
                     .collect())
             }
+            Values::Variable(name) => match lookup(&self.variables, name)? {
+                Value::List(values) => values.iter().map(Value::scalar).collect(),
+                _ => Err(Error::message("for variable source must be a list")),
+            },
         }
     }
 
@@ -559,7 +661,7 @@ impl Runtime {
             let mut first_error = None;
             for value in values {
                 let mut runtime = self.clone();
-                runtime.variables.insert(name.into(), value);
+                runtime.variables.insert(name.into(), Value::String(value));
                 runtime.report = ScriptReport::default();
                 match runtime.execute(body) {
                     Ok(()) => {
@@ -578,7 +680,9 @@ impl Runtime {
                 .map(|value| {
                     let mut runtime = self.clone();
                     runtime.parallel_depth += 1;
-                    runtime.variables.insert(name.into(), value.clone());
+                    runtime
+                        .variables
+                        .insert(name.into(), Value::String(value.clone()));
                     runtime.report = ScriptReport::default();
                     let body = body.to_vec();
                     if self.options.dry_run {
@@ -594,7 +698,9 @@ impl Runtime {
             if self.options.dry_run {
                 for value in batch {
                     let mut runtime = self.clone();
-                    runtime.variables.insert(name.into(), value.clone());
+                    runtime
+                        .variables
+                        .insert(name.into(), Value::String(value.clone()));
                     runtime.report = ScriptReport::default();
                     runtime.execute(body)?;
                 }
@@ -623,7 +729,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn call(&mut self, name: &str, arguments: &str) -> Result<()> {
+    fn call(&mut self, name: &str, arguments: &str) -> Result<Value> {
         if self.call_depth >= MAX_FUNCTION_CALL_DEPTH {
             return Err(Error::message(format!(
                 "function call depth exceeded the limit of {MAX_FUNCTION_CALL_DEPTH}"
@@ -634,7 +740,10 @@ impl Runtime {
             .get(name)
             .cloned()
             .ok_or_else(|| Error::message(format!("undefined function `{name}`")))?;
-        let arguments = words(arguments, &self.variables)?;
+        let arguments = argument_sources(arguments)?
+            .into_iter()
+            .map(|argument| self.eval_value(argument))
+            .collect::<Result<Vec<_>>>()?;
         if arguments.len() != parameters.len() {
             return Err(Error::message(format!(
                 "function `{name}` expects {} arguments, got {}",
@@ -647,9 +756,116 @@ impl Runtime {
             self.variables.insert(parameter, argument);
         }
         self.call_depth += 1;
-        let result = self.execute(&body);
+        let saved_value = self.last_value.clone();
+        let result = self.execute(&body).map(|()| self.last_value.clone());
         self.call_depth -= 1;
         self.variables = saved;
+        self.last_value = saved_value;
+        result
+    }
+
+    fn create_temporary(&mut self, name: &str, directory: bool) -> Result<()> {
+        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("shrimp-{}-{id}", std::process::id()));
+        self.trace(&format!(
+            "{} {}",
+            if directory { "temp_dir" } else { "temp_file" },
+            path.display()
+        ));
+        if !self.options.dry_run {
+            if directory {
+                std::fs::create_dir(&path)
+                    .map_err(|e| Error::io("create temporary directory", Some(path.clone()), e))?;
+            } else {
+                std::fs::File::create_new(&path)
+                    .map_err(|e| Error::io("create temporary file", Some(path.clone()), e))?;
+            }
+            self.temporary_paths
+                .lock()
+                .expect("temporary path registry poisoned")
+                .push(path.clone());
+        }
+        let value = Value::String(path.to_string_lossy().into_owned());
+        self.variables.insert(name.into(), value.clone());
+        self.last_value = value;
+        Ok(())
+    }
+
+    fn cleanup_temporaries(&self) {
+        let mut paths = self
+            .temporary_paths
+            .lock()
+            .expect("temporary path registry poisoned");
+        for path in paths.drain(..).rev() {
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+        }
+    }
+
+    fn metadata(&mut self, name: &str, source: &str, modified: bool) -> Result<()> {
+        let path = resolve(self.context.cwd(), &self.expand_single(source)?);
+        let metadata = std::fs::metadata(&path)
+            .map_err(|e| Error::io("read metadata", Some(path.clone()), e))?;
+        let number = if modified {
+            metadata
+                .modified()
+                .map_err(|e| Error::io("read modification time", Some(path.clone()), e))?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| Error::message("modification time is before the Unix epoch"))?
+                .as_secs()
+                .try_into()
+                .map_err(|_| Error::message("modification time does not fit in an integer"))?
+        } else {
+            metadata
+                .len()
+                .try_into()
+                .map_err(|_| Error::message("file size does not fit in an integer"))?
+        };
+        let value = Value::Integer(number);
+        self.variables.insert(name.into(), value.clone());
+        self.last_value = value;
+        Ok(())
+    }
+
+    fn include(&mut self, source: &str) -> Result<()> {
+        let requested = self.expand_single(source)?;
+        let base = self
+            .source_dirs
+            .last()
+            .expect("runtime always has a source directory");
+        let path = resolve(base, &requested);
+        let path = std::fs::canonicalize(&path)
+            .map_err(|error| Error::io("resolve include", Some(path), error))?;
+        if self.loaded_includes.contains(&path) {
+            return Ok(());
+        }
+        if !self.active_includes.insert(path.clone()) {
+            return Err(Error::message(format!(
+                "include cycle detected at {}",
+                path.display()
+            )));
+        }
+        let result = (|| {
+            let source = std::fs::read_to_string(&path)
+                .map_err(|error| Error::io("read include", Some(path.clone()), error))?;
+            let script = Script::parse(&source).map_err(|error| {
+                Error::message(format!("in included file {}: {error}", path.display()))
+            })?;
+            self.source_dirs
+                .push(path.parent().expect("included file has parent").to_owned());
+            let result = self.execute(&script.statements).map_err(|error| {
+                Error::message(format!("in included file {}: {error}", path.display()))
+            });
+            self.source_dirs.pop();
+            result
+        })();
+        self.active_includes.remove(&path);
+        if result.is_ok() {
+            self.loaded_includes.insert(path);
+        }
         result
     }
 
@@ -664,15 +880,122 @@ impl Runtime {
         Ok(values.into_iter().next().expect("one value"))
     }
 
+    fn eval_value(&self, source: &str) -> Result<Value> {
+        let source = source.trim();
+        if source == "true" {
+            return Ok(Value::Boolean(true));
+        }
+        if source == "false" {
+            return Ok(Value::Boolean(false));
+        }
+        if let Ok(value) = source.parse::<i64>() {
+            return Ok(Value::Integer(value));
+        }
+        for (prefix, kind) in [("words ", 0), ("lines ", 1), ("glob ", 2)] {
+            if let Some(rest) = source.strip_prefix(prefix) {
+                let values = self.values(&match kind {
+                    0 => Values::Words(rest.into()),
+                    1 => Values::Lines(rest.into()),
+                    _ => Values::Glob(rest.into()),
+                })?;
+                return Ok(Value::List(values.into_iter().map(Value::String).collect()));
+            }
+        }
+        if source.starts_with("${") && source.ends_with('}') && source.matches("${").count() == 1 {
+            let name = &source[2..source.len() - 1];
+            if let Ok(value) = lookup(&self.variables, name) {
+                return Ok(value.clone());
+            }
+        }
+        Ok(Value::String(self.expand_single(source)?))
+    }
+
+    fn condition(&self, source: &str) -> Result<bool> {
+        let tokens = words(source, &self.variables)?;
+        if let Some(position) = tokens.iter().position(|v| v == "or") {
+            return Ok(self.condition(&tokens[..position].join(" "))?
+                || self.condition(&tokens[position + 1..].join(" "))?);
+        }
+        if let Some(position) = tokens.iter().position(|v| v == "and") {
+            return Ok(self.condition(&tokens[..position].join(" "))?
+                && self.condition(&tokens[position + 1..].join(" "))?);
+        }
+        if tokens.first().is_some_and(|v| v == "not") {
+            return Ok(!self.condition(&tokens[1..].join(" "))?);
+        }
+        if tokens.first().is_some_and(|v| v == "exists") && tokens.len() == 2 {
+            return Ok(resolve(self.context.cwd(), &tokens[1]).exists());
+        }
+        if tokens.len() == 3 && ["==", "!=", "<", "<=", ">", ">="].contains(&tokens[1].as_str()) {
+            let operand = |text: &str| -> Result<Value> {
+                if let Some(value) = self.variables.get(text) {
+                    return Ok(value.clone());
+                }
+                if text == "true" || text == "false" || text.parse::<i64>().is_ok() {
+                    self.eval_value(text)
+                } else {
+                    Ok(Value::String(text.into()))
+                }
+            };
+            let left = operand(&tokens[0])?;
+            let right = operand(&tokens[2])?;
+            return match tokens[1].as_str() {
+                "==" => Ok(left == right),
+                "!=" => Ok(left != right),
+                operator => match (left, right) {
+                    (Value::Integer(a), Value::Integer(b)) => Ok(match operator {
+                        "<" => a < b,
+                        "<=" => a <= b,
+                        ">" => a > b,
+                        _ => a >= b,
+                    }),
+                    _ => Err(Error::message("ordered comparisons require integers")),
+                },
+            };
+        }
+        if tokens.len() == 1 {
+            return match self.variables.get(&tokens[0]) {
+                Some(Value::Boolean(v)) => Ok(*v),
+                _ => Err(Error::message("condition must be boolean")),
+            };
+        }
+        Err(Error::message("invalid condition expression"))
+    }
+
     fn invocation(&self, source: &str) -> Result<Invocation> {
-        let (command, redirect) = extract_redirect(source)?;
+        let (environment, source) = if let Some(rest) = source.strip_prefix("env ") {
+            let (bindings, command) = rest.split_once(" $ ").ok_or_else(|| {
+                Error::message("environment override syntax: env NAME=VALUE $ command")
+            })?;
+            let bindings = words(bindings, &self.variables)?
+                .into_iter()
+                .map(|binding| {
+                    let (name, value) = binding.split_once('=').ok_or_else(|| {
+                        Error::message(format!(
+                            "environment override `{binding}` must be NAME=VALUE"
+                        ))
+                    })?;
+                    valid_env_name(name)?;
+                    Ok((name.to_owned(), value.to_owned()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (bindings, command)
+        } else {
+            (Vec::new(), source)
+        };
+        let (source, redirect) = extract_redirect(source)?;
+        let (command, input) = extract_input(source)?;
         let pieces = split_pipeline(command)?;
         let mut commands = pieces.into_iter().map(|piece| {
             let mut values = words(piece, &self.variables)?.into_iter();
             let program = values
                 .next()
                 .ok_or_else(|| Error::message("empty command in pipeline"))?;
-            Ok(cmd(program).args(values))
+            let mut command = cmd(program).args(values);
+            for (name, value) in &environment {
+                command = command.env(name, value);
+            }
+            Ok(command)
         });
         let first = commands
             .next()
@@ -680,6 +1003,15 @@ impl Runtime {
         let mut pipeline = first.pipeline();
         for command in commands {
             pipeline = pipeline.pipe(command?);
+        }
+        if let Some((inline, value)) = input {
+            let bytes = if inline {
+                self.expand_single(value)?.into_bytes()
+            } else {
+                let path = resolve(self.context.cwd(), &self.expand_single(value)?);
+                std::fs::read(&path).map_err(|e| Error::io("read command stdin", Some(path), e))?
+            };
+            pipeline = pipeline.stdin(bytes);
         }
         let redirect = redirect
             .map(|(kind, path)| Ok::<_, Error>((kind, self.expand_single(path)?)))
@@ -705,10 +1037,10 @@ impl Runtime {
     }
     fn redact(&self, mut value: String) -> String {
         for name in &self.secrets {
-            if let Some(secret) = self.variables.get(name)
+            if let Some(secret) = self.variables.get(name).and_then(|v| v.scalar().ok())
                 && !secret.is_empty()
             {
-                value = value.replace(secret, "[REDACTED]");
+                value = value.replace(&secret, "[REDACTED]");
             }
         }
         value
@@ -726,6 +1058,11 @@ struct Invocation {
     redirect: Option<(RedirectKind, String)>,
 }
 impl Invocation {
+    fn changes_file(&self) -> bool {
+        self.redirect
+            .as_ref()
+            .is_some_and(|(_, path)| path != "discard")
+    }
     fn run(&self, context: &Context) -> Result<CommandOutput> {
         self.pipeline.run(context)
     }
@@ -733,7 +1070,22 @@ impl Invocation {
         match &self.redirect {
             None => emit(output),
             Some((kind, path)) => {
+                if path == "discard" {
+                    return match kind {
+                        RedirectKind::Stdout | RedirectKind::Append => std::io::stderr()
+                            .write_all(&output.stderr)
+                            .map_err(|e| Error::io("write stderr", None, e)),
+                        RedirectKind::Stderr => std::io::stdout()
+                            .write_all(&output.stdout)
+                            .map_err(|e| Error::io("write stdout", None, e)),
+                    };
+                }
                 let path = resolve(context.cwd(), path);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        Error::io("create redirect parent directories", Some(parent.into()), e)
+                    })?;
+                }
                 match kind {
                     RedirectKind::Stdout => {
                         std::fs::write(&path, &output.stdout)
@@ -794,6 +1146,17 @@ fn attach_line(line: usize, error: Error) -> Error {
         Error::Script { .. } => error,
         other => script_error(line, other.to_string()),
     }
+}
+
+fn is_expression(source: &str) -> bool {
+    let padded = format!(" {source} ");
+    source.starts_with("exists ")
+        || source.starts_with("not ")
+        || [
+            " == ", " != ", " < ", " <= ", " > ", " >= ", " and ", " or ",
+        ]
+        .iter()
+        .any(|operator| padded.contains(operator))
 }
 
 fn logical_lines(source: &str) -> Result<Vec<(usize, String)>> {
@@ -915,10 +1278,12 @@ fn parse_block(
                 Values::Lines(v.into())
             } else if let Some(v) = source.strip_prefix("words ") {
                 Values::Words(v.into())
+            } else if let Some(name) = source.strip_prefix("${").and_then(|v| v.strip_suffix('}')) {
+                Values::Variable(name.into())
             } else {
                 return Err(script_error(
                     *line,
-                    "for source must be glob, lines, or words",
+                    "for source must be glob, lines, words, or a list variable",
                 ));
             };
             let (body, end) = parse_block(lines, position, true)?;
@@ -970,6 +1335,10 @@ fn parse_block(
                     Ok(v.to_owned())
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let unique: HashSet<_> = parameters.iter().collect();
+            if unique.len() != parameters.len() {
+                return Err(script_error(*line, "function parameters must be unique"));
+            }
             let (body, end) = parse_block(lines, position, true)?;
             require_end(*line, end)?;
             StatementKind::Function {
@@ -1007,8 +1376,13 @@ fn parse_values(line: usize, source: &str) -> Result<Values> {
         Ok(Values::Lines(value.into()))
     } else if let Some(value) = source.strip_prefix("words ") {
         Ok(Values::Words(value.into()))
+    } else if let Some(name) = source.strip_prefix("${").and_then(|v| v.strip_suffix('}')) {
+        Ok(Values::Variable(name.into()))
     } else {
-        Err(script_error(line, "source must be glob, lines, or words"))
+        Err(script_error(
+            line,
+            "source must be glob, lines, words, or a list variable",
+        ))
     }
 }
 
@@ -1017,6 +1391,8 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
         assignment(rest, false)?
     } else if let Some(rest) = text.strip_prefix("secret ") {
         assignment(rest, true)?
+    } else if let Some(path) = text.strip_prefix("include ") {
+        StatementKind::Include(path.into())
     } else if let Some(rest) = text.strip_prefix("capture ") {
         let (name, command) = split_operator(rest, "<-")?;
         valid_name(name)?;
@@ -1026,6 +1402,8 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
         }
     } else if let Some(command) = text.strip_prefix("$ ") {
         StatementKind::Run(command.into())
+    } else if text.starts_with("env ") && text.contains(" $ ") {
+        StatementKind::Run(text.into())
     } else if let Some(rest) = text.strip_prefix("retry ") {
         let (count, command) = rest
             .split_once(' ')
@@ -1106,9 +1484,48 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
         }
     } else if let Some(v) = text.strip_prefix("print ") {
         StatementKind::Print(v.into())
+    } else if let Some(v) = text.strip_prefix("value ") {
+        StatementKind::Value(v.into())
+    } else if let Some(name) = text.strip_prefix("temp_file ") {
+        valid_name(name)?;
+        StatementKind::Temp {
+            name: name.into(),
+            directory: false,
+        }
+    } else if let Some(name) = text.strip_prefix("temp_dir ") {
+        valid_name(name)?;
+        StatementKind::Temp {
+            name: name.into(),
+            directory: true,
+        }
+    } else if let Some(rest) = text.strip_prefix("file_size ") {
+        let (name, path) = split_operator(rest, "<-")?;
+        valid_name(name)?;
+        StatementKind::Metadata {
+            name: name.into(),
+            path: path.into(),
+            modified: false,
+        }
+    } else if let Some(rest) = text.strip_prefix("modified_time ") {
+        let (name, path) = split_operator(rest, "<-")?;
+        valid_name(name)?;
+        StatementKind::Metadata {
+            name: name.into(),
+            path: path.into(),
+            modified: true,
+        }
     } else if let Some(rest) = text.strip_prefix("call ") {
-        let (name, args) = rest.split_once(' ').unwrap_or((rest, ""));
+        let (target, invocation) = if rest.contains("<-") {
+            let (target, invocation) = split_operator(rest, "<-")?;
+            valid_name(target)?;
+            (Some(target.into()), invocation)
+        } else {
+            (None, rest)
+        };
+        let (name, args) = invocation.split_once(' ').unwrap_or((invocation, ""));
+        valid_name(name)?;
         StatementKind::Call {
+            target,
             name: name.into(),
             arguments: args.into(),
         }
@@ -1178,6 +1595,56 @@ fn valid_name(name: &str) -> Result<()> {
     } else {
         Err(Error::message(format!("invalid name `{name}`")))
     }
+}
+
+fn valid_env_name(name: &str) -> Result<()> {
+    if !name.is_empty()
+        && name.chars().enumerate().all(|(index, c)| {
+            c == '_' || c.is_ascii_alphanumeric() && (index > 0 || !c.is_ascii_digit())
+        })
+    {
+        Ok(())
+    } else {
+        Err(Error::message(format!("invalid environment name `{name}`")))
+    }
+}
+
+/// Extracts one stdin source after output redirection has been removed.
+fn extract_input(line: &str) -> Result<(&str, Option<(bool, &str)>)> {
+    let mut quote = None;
+    let mut escaped = false;
+    let bytes = line.as_bytes();
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '\'' || character == '"' {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+            continue;
+        }
+        if quote.is_none() && character == '<' {
+            if bytes.get(index + 1) == Some(&b'-') {
+                continue;
+            }
+            let inline = bytes.get(index + 1) == Some(&b'<') && bytes.get(index + 2) == Some(&b'<');
+            let length = if inline { 3 } else { 1 };
+            let value = line[index + length..].trim();
+            if value.is_empty() {
+                return Err(Error::message("stdin redirection needs a file or value"));
+            }
+            return Ok((line[..index].trim(), Some((inline, value))));
+        }
+    }
+    Ok((line, None))
 }
 
 fn extract_redirect(line: &str) -> Result<(&str, Option<(RedirectKind, &str)>)> {
@@ -1282,7 +1749,83 @@ fn split_pipeline(line: &str) -> Result<Vec<&str>> {
     result.push(line[start..].trim());
     Ok(result)
 }
-fn words(source: &str, variables: &HashMap<String, String>) -> Result<Vec<String>> {
+fn lookup<'a>(variables: &'a HashMap<String, Value>, path: &str) -> Result<&'a Value> {
+    let (base, mut rest) = path
+        .split_once(['.', '['])
+        .map_or((path, ""), |(a, _)| (a, &path[a.len()..]));
+    let mut value = variables
+        .get(base)
+        .ok_or_else(|| Error::message(format!("undefined variable `{base}`")))?;
+    while !rest.is_empty() {
+        if let Some(field) = rest.strip_prefix('.') {
+            let end = field.find(['.', '[']).unwrap_or(field.len());
+            let key = &field[..end];
+            value = match value {
+                Value::Record(values) => values.get(key),
+                _ => None,
+            }
+            .ok_or_else(|| Error::message(format!("missing record field `{key}`")))?;
+            rest = &field[end..];
+        } else if let Some(index) = rest.strip_prefix('[') {
+            let end = index
+                .find(']')
+                .ok_or_else(|| Error::message("unclosed list index"))?;
+            let number: usize = index[..end]
+                .parse()
+                .map_err(|_| Error::message("list index must be a non-negative integer"))?;
+            value = match value {
+                Value::List(values) => values.get(number),
+                _ => None,
+            }
+            .ok_or_else(|| Error::message(format!("list index {number} is out of bounds")))?;
+            rest = &index[end + 1..];
+        } else {
+            return Err(Error::message(format!("invalid value path `{path}`")));
+        }
+    }
+    Ok(value)
+}
+
+fn argument_sources(source: &str) -> Result<Vec<&str>> {
+    let mut result = Vec::new();
+    let mut start = None;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in source.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            start.get_or_insert(index);
+            continue;
+        }
+        if character == '\'' || character == '"' {
+            start.get_or_insert(index);
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+        } else if character.is_whitespace() && quote.is_none() {
+            if let Some(begin) = start.take() {
+                result.push(&source[begin..index]);
+            }
+        } else {
+            start.get_or_insert(index);
+        }
+    }
+    if quote.is_some() {
+        return Err(Error::message("unclosed quote"));
+    }
+    if let Some(begin) = start {
+        result.push(&source[begin..]);
+    }
+    Ok(result)
+}
+
+fn words(source: &str, variables: &HashMap<String, Value>) -> Result<Vec<String>> {
     let mut result = Vec::new();
     let mut word = String::new();
     let mut quote = None;
@@ -1332,11 +1875,7 @@ fn words(source: &str, variables: &HashMap<String, String>) -> Result<Vec<String
                 if !closed {
                     return Err(Error::message("unclosed variable interpolation"));
                 }
-                let value = variables
-                    .get(&name)
-                    .cloned()
-                    .ok_or_else(|| Error::message(format!("undefined variable `{name}`")))?;
-                word.push_str(&value)
+                word.push_str(&lookup(variables, &name)?.scalar()?)
             }
             other => {
                 started = true;

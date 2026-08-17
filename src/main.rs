@@ -14,6 +14,7 @@ fn main() -> ExitCode {
 fn run() -> shrimp::Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
     let mut options = ScriptOptions::default();
+    let mut check = false;
     while let Some(argument) = args.peek() {
         if argument == "--dry-run" {
             options.dry_run = true;
@@ -21,18 +22,23 @@ fn run() -> shrimp::Result<()> {
         } else if argument == "--trace" {
             options.trace = true;
             args.next();
+        } else if argument == "--check" {
+            check = true;
+            args.next();
         } else {
             break;
         }
     }
     let Some(path) = args.next() else {
         eprintln!(
-            "Usage: shrimp [--dry-run] [--trace] <workflow.shrimp> [NAME=VALUE ...]\n\nRun a portable Shrimp workflow. Extra NAME=VALUE arguments become variables."
+            "Usage: shrimp [--check] [--dry-run] [--trace] <workflow.shrimp> [NAME=VALUE ...]\n\nRun a portable Shrimp workflow. Extra NAME=VALUE arguments become variables."
         );
         return Err(shrimp::Error::message("missing script path"));
     };
     if path == "--help" || path == "-h" {
-        println!("Usage: shrimp [--dry-run] [--trace] <workflow.shrimp> [NAME=VALUE ...]");
+        println!(
+            "Usage: shrimp [--check] [--dry-run] [--trace] <workflow.shrimp> [NAME=VALUE ...]"
+        );
         return Ok(());
     }
     let path = PathBuf::from(path);
@@ -52,6 +58,10 @@ fn run() -> shrimp::Result<()> {
         context = context.with_env(name, value);
     }
     let script = Script::from_file(&path)?;
+    if check {
+        eprintln!("shrimp: syntax OK");
+        return Ok(());
+    }
     let report = script.run_with_options(&context, options)?;
     eprintln!(
         "shrimp: completed ({} commands, {} file changes)",

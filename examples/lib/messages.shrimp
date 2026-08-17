@@ -1,0 +1,3 @@
+fn announce artifact
+  print "built ${artifact}"
+end

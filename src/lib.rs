@@ -11,7 +11,7 @@ mod task;
 
 pub use command::{Cmd, CommandOutput, Pipeline};
 pub use error::{Error, Result};
-pub use script::{Script, ScriptOptions, ScriptReport};
+pub use script::{Script, ScriptOptions, ScriptReport, Value};
 pub use task::{Context, Task};
 
 /// Filesystem operations lifted into reusable [`Task`] values.

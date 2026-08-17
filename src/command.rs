@@ -50,11 +50,13 @@ impl Cmd {
     pub fn pipe(self, next: Cmd) -> Pipeline {
         Pipeline {
             commands: vec![self, next],
+            stdin: None,
         }
     }
     pub fn pipeline(self) -> Pipeline {
         Pipeline {
             commands: vec![self],
+            stdin: None,
         }
     }
     pub fn task(self) -> Task<CommandOutput> {
@@ -63,6 +65,7 @@ impl Cmd {
     pub fn run(&self, context: &Context) -> Result<CommandOutput> {
         Pipeline {
             commands: vec![self.clone()],
+            stdin: None,
         }
         .run(context)
     }
@@ -70,6 +73,7 @@ impl Cmd {
     pub fn run_unchecked(&self, context: &Context) -> Result<CommandOutput> {
         Pipeline {
             commands: vec![self.clone()],
+            stdin: None,
         }
         .run_unchecked(context)
     }
@@ -126,11 +130,17 @@ fn quote(value: &OsStr) -> String {
 #[derive(Clone, Debug)]
 pub struct Pipeline {
     commands: Vec<Cmd>,
+    stdin: Option<Vec<u8>>,
 }
 
 type PipelineFailure = (String, ExitStatus, Vec<u8>);
 
 impl Pipeline {
+    /// Feeds these bytes to the first process without invoking a shell.
+    pub fn stdin(mut self, input: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(input.into());
+        self
+    }
     pub fn pipe(mut self, next: Cmd) -> Self {
         self.commands.push(next);
         self
@@ -177,12 +187,14 @@ impl Pipeline {
         for (index, specification) in self.commands.iter().enumerate() {
             let last = index + 1 == self.commands.len();
             let mut command = specification.command(context, true);
-            command.stdin(
+            command.stdin(if index == 0 && self.stdin.is_some() {
+                Stdio::piped()
+            } else {
                 previous_stdout
                     .take()
                     .map(Stdio::from)
-                    .unwrap_or_else(Stdio::null),
-            );
+                    .unwrap_or_else(Stdio::null)
+            });
             command.stdout(Stdio::piped()).stderr(if last {
                 Stdio::piped()
             } else {
@@ -198,6 +210,16 @@ impl Pipeline {
                     return Err(Error::io("spawn command", None, error));
                 }
             };
+            if index == 0
+                && let Some(input) = &self.stdin
+            {
+                let mut stdin = child.stdin.take().expect("piped stdin");
+                let input = input.clone();
+                thread::spawn(move || {
+                    use std::io::Write as _;
+                    let _ = stdin.write_all(&input);
+                });
+            }
             if last {
                 final_stdout = child.stdout.take();
                 final_stderr = child.stderr.take();
@@ -275,12 +297,14 @@ impl Pipeline {
         for (index, specification) in self.commands.iter().enumerate() {
             let last = index + 1 == self.commands.len();
             let mut command = specification.command(context, false);
-            command.stdin(
+            command.stdin(if index == 0 && self.stdin.is_some() {
+                Stdio::piped()
+            } else {
                 previous_stdout
                     .take()
                     .map(Stdio::from)
-                    .unwrap_or_else(Stdio::null),
-            );
+                    .unwrap_or_else(Stdio::null)
+            });
             // Intermediate stderr is inherited so a noisy child cannot fill an
             // unread pipe and deadlock the pipeline. The final stderr is captured.
             command.stdout(Stdio::piped()).stderr(if last {
@@ -298,6 +322,16 @@ impl Pipeline {
                     return Err(Error::io("spawn command", None, error));
                 }
             };
+            if index == 0
+                && let Some(input) = &self.stdin
+            {
+                let mut stdin = child.stdin.take().expect("piped stdin");
+                let input = input.clone();
+                thread::spawn(move || {
+                    use std::io::Write as _;
+                    let _ = stdin.write_all(&input);
+                });
+            }
             if !last {
                 previous_stdout = child.stdout.take();
             }
