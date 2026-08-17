@@ -80,7 +80,7 @@ pub fn write_atomic(path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> T
     })
 }
 
-fn create_parent(path: &Path) -> Result<()> {
+pub(crate) fn create_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         io(
             "create parent directories",

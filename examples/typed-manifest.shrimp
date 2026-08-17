@@ -5,7 +5,7 @@ for line in lines "${manifest}"
   record document tsv "${line}" fields name state source
   if exists "${document.source}"
     capture digest <- sha256sum "${document.source}"
-    write "generated/${document.name}.txt" <- "${digest}\n"
+    append "generated/manifest-digests.txt" <- "${document.name}\t${digest}\n"
   else
     print "missing ${document.source}"
   end

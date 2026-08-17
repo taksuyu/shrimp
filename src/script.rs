@@ -7,7 +7,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -68,6 +68,28 @@ pub struct ScriptOptions {
 struct Statement {
     line: usize,
     kind: StatementKind,
+}
+
+#[derive(Clone)]
+struct FunctionDefinition {
+    parameters: Vec<String>,
+    body: Vec<Statement>,
+    source_dir: PathBuf,
+}
+
+#[derive(Default)]
+struct IncludeRegistry {
+    loaded: HashMap<PathBuf, IncludeExports>,
+    active: HashSet<PathBuf>,
+    owner: Option<thread::ThreadId>,
+    depth: usize,
+}
+
+#[derive(Clone, Default)]
+struct IncludeExports {
+    variables: HashMap<String, Value>,
+    functions: HashMap<String, FunctionDefinition>,
+    secrets: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -219,8 +241,7 @@ impl Script {
             options,
             report: ScriptReport::default(),
             source_dirs: vec![context.cwd().to_owned()],
-            loaded_includes: HashSet::new(),
-            active_includes: HashSet::new(),
+            includes: Arc::new((Mutex::new(IncludeRegistry::default()), Condvar::new())),
             last_value: Value::Missing,
             temporary_paths: Arc::new(Mutex::new(Vec::new())),
         };
@@ -237,14 +258,13 @@ struct Runtime {
     context: Context,
     variables: HashMap<String, Value>,
     secrets: HashSet<String>,
-    functions: HashMap<String, (Vec<String>, Vec<Statement>)>,
+    functions: HashMap<String, FunctionDefinition>,
     call_depth: usize,
     parallel_depth: usize,
     options: ScriptOptions,
     report: ScriptReport,
     source_dirs: Vec<PathBuf>,
-    loaded_includes: HashSet<PathBuf>,
-    active_includes: HashSet<PathBuf>,
+    includes: Arc<(Mutex<IncludeRegistry>, Condvar)>,
     last_value: Value,
     temporary_paths: Arc<Mutex<Vec<PathBuf>>>,
 }
@@ -372,11 +392,7 @@ impl Runtime {
                     path.display()
                 ));
                 if !self.options.dry_run {
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent).map_err(|e| {
-                            Error::io("create parent directories", Some(parent.into()), e)
-                        })?;
-                    }
+                    files::create_parent(&path)?;
                     if *append {
                         let mut file = std::fs::OpenOptions::new()
                             .create(true)
@@ -472,7 +488,7 @@ impl Runtime {
                 }
             }
             StatementKind::If { command, yes, no } => {
-                let expression = is_expression(command);
+                let expression = self.is_expression(command)?;
                 if expression {
                     self.trace(&format!("if {command}"));
                 } else {
@@ -524,8 +540,18 @@ impl Runtime {
                 parameters,
                 body,
             } => {
-                self.functions
-                    .insert(name.clone(), (parameters.clone(), body.clone()));
+                self.functions.insert(
+                    name.clone(),
+                    FunctionDefinition {
+                        parameters: parameters.clone(),
+                        body: body.clone(),
+                        source_dir: self
+                            .source_dirs
+                            .last()
+                            .expect("runtime always has a source directory")
+                            .clone(),
+                    },
+                );
             }
             StatementKind::Call {
                 target,
@@ -735,7 +761,7 @@ impl Runtime {
                 "function call depth exceeded the limit of {MAX_FUNCTION_CALL_DEPTH}"
             )));
         }
-        let (parameters, body) = self
+        let definition = self
             .functions
             .get(name)
             .cloned()
@@ -744,20 +770,24 @@ impl Runtime {
             .into_iter()
             .map(|argument| self.eval_value(argument))
             .collect::<Result<Vec<_>>>()?;
-        if arguments.len() != parameters.len() {
+        if arguments.len() != definition.parameters.len() {
             return Err(Error::message(format!(
                 "function `{name}` expects {} arguments, got {}",
-                parameters.len(),
+                definition.parameters.len(),
                 arguments.len()
             )));
         }
         let saved = self.variables.clone();
-        for (parameter, argument) in parameters.into_iter().zip(arguments) {
+        for (parameter, argument) in definition.parameters.into_iter().zip(arguments) {
             self.variables.insert(parameter, argument);
         }
         self.call_depth += 1;
         let saved_value = self.last_value.clone();
-        let result = self.execute(&body).map(|()| self.last_value.clone());
+        self.source_dirs.push(definition.source_dir);
+        let result = self
+            .execute(&definition.body)
+            .map(|()| self.last_value.clone());
+        self.source_dirs.pop();
         self.call_depth -= 1;
         self.variables = saved;
         self.last_value = saved_value;
@@ -774,10 +804,10 @@ impl Runtime {
         ));
         if !self.options.dry_run {
             if directory {
-                std::fs::create_dir(&path)
+                create_private_dir(&path)
                     .map_err(|e| Error::io("create temporary directory", Some(path.clone()), e))?;
             } else {
-                std::fs::File::create_new(&path)
+                create_private_file(&path)
                     .map_err(|e| Error::io("create temporary file", Some(path.clone()), e))?;
             }
             self.temporary_paths
@@ -839,15 +869,36 @@ impl Runtime {
         let path = resolve(base, &requested);
         let path = std::fs::canonicalize(&path)
             .map_err(|error| Error::io("resolve include", Some(path), error))?;
-        if self.loaded_includes.contains(&path) {
-            return Ok(());
+        let current_thread = thread::current().id();
+        let includes = Arc::clone(&self.includes);
+        let (lock, changed) = &*includes;
+        loop {
+            let mut registry = lock.lock().expect("include registry poisoned");
+            if let Some(exports) = registry.loaded.get(&path).cloned() {
+                drop(registry);
+                self.variables.extend(exports.variables);
+                self.functions.extend(exports.functions);
+                self.secrets.extend(exports.secrets);
+                return Ok(());
+            }
+            if registry.owner.is_some_and(|owner| owner != current_thread) {
+                drop(changed.wait(registry).expect("include registry poisoned"));
+                continue;
+            }
+            if registry.active.contains(&path) {
+                return Err(Error::message(format!(
+                    "include cycle detected at {}",
+                    path.display()
+                )));
+            }
+            registry.owner = Some(current_thread);
+            registry.depth += 1;
+            registry.active.insert(path.clone());
+            break;
         }
-        if !self.active_includes.insert(path.clone()) {
-            return Err(Error::message(format!(
-                "include cycle detected at {}",
-                path.display()
-            )));
-        }
+        let variables_before = self.variables.clone();
+        let functions_before = self.functions.clone();
+        let secrets_before = self.secrets.clone();
         let result = (|| {
             let source = std::fs::read_to_string(&path)
                 .map_err(|error| Error::io("read include", Some(path.clone()), error))?;
@@ -862,10 +913,36 @@ impl Runtime {
             self.source_dirs.pop();
             result
         })();
-        self.active_includes.remove(&path);
-        if result.is_ok() {
-            self.loaded_includes.insert(path);
+        let mut registry = lock.lock().expect("include registry poisoned");
+        registry.active.remove(&path);
+        registry.depth -= 1;
+        if registry.depth == 0 {
+            registry.owner = None;
         }
+        if result.is_ok() {
+            let variables = self
+                .variables
+                .iter()
+                .filter(|(name, value)| variables_before.get(*name) != Some(*value))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            let functions = self
+                .functions
+                .iter()
+                .filter(|(name, _)| !functions_before.contains_key(*name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            let secrets = self.secrets.difference(&secrets_before).cloned().collect();
+            registry.loaded.insert(
+                path,
+                IncludeExports {
+                    variables,
+                    functions,
+                    secrets,
+                },
+            );
+        }
+        changed.notify_all();
         result
     }
 
@@ -911,35 +988,29 @@ impl Runtime {
     }
 
     fn condition(&self, source: &str) -> Result<bool> {
-        let tokens = words(source, &self.variables)?;
-        if let Some(position) = tokens.iter().position(|v| v == "or") {
-            return Ok(self.condition(&tokens[..position].join(" "))?
-                || self.condition(&tokens[position + 1..].join(" "))?);
+        let tokens = argument_sources(source)?;
+        self.condition_tokens(&tokens)
+    }
+
+    fn condition_tokens(&self, tokens: &[&str]) -> Result<bool> {
+        if let Some(position) = tokens.iter().position(|v| *v == "or") {
+            return Ok(self.condition_tokens(&tokens[..position])?
+                || self.condition_tokens(&tokens[position + 1..])?);
         }
-        if let Some(position) = tokens.iter().position(|v| v == "and") {
-            return Ok(self.condition(&tokens[..position].join(" "))?
-                && self.condition(&tokens[position + 1..].join(" "))?);
+        if let Some(position) = tokens.iter().position(|v| *v == "and") {
+            return Ok(self.condition_tokens(&tokens[..position])?
+                && self.condition_tokens(&tokens[position + 1..])?);
         }
-        if tokens.first().is_some_and(|v| v == "not") {
-            return Ok(!self.condition(&tokens[1..].join(" "))?);
+        if tokens.first().is_some_and(|v| *v == "not") {
+            return Ok(!self.condition_tokens(&tokens[1..])?);
         }
-        if tokens.first().is_some_and(|v| v == "exists") && tokens.len() == 2 {
-            return Ok(resolve(self.context.cwd(), &tokens[1]).exists());
+        if tokens.first().is_some_and(|v| *v == "exists") && tokens.len() == 2 {
+            return Ok(resolve(self.context.cwd(), &self.expand_single(tokens[1])?).exists());
         }
-        if tokens.len() == 3 && ["==", "!=", "<", "<=", ">", ">="].contains(&tokens[1].as_str()) {
-            let operand = |text: &str| -> Result<Value> {
-                if let Some(value) = self.variables.get(text) {
-                    return Ok(value.clone());
-                }
-                if text == "true" || text == "false" || text.parse::<i64>().is_ok() {
-                    self.eval_value(text)
-                } else {
-                    Ok(Value::String(text.into()))
-                }
-            };
-            let left = operand(&tokens[0])?;
-            let right = operand(&tokens[2])?;
-            return match tokens[1].as_str() {
+        if tokens.len() == 3 && ["==", "!=", "<", "<=", ">", ">="].contains(&tokens[1]) {
+            let left = self.condition_operand(tokens[0])?;
+            let right = self.condition_operand(tokens[2])?;
+            return match tokens[1] {
                 "==" => Ok(left == right),
                 "!=" => Ok(left != right),
                 operator => match (left, right) {
@@ -954,12 +1025,50 @@ impl Runtime {
             };
         }
         if tokens.len() == 1 {
-            return match self.variables.get(&tokens[0]) {
-                Some(Value::Boolean(v)) => Ok(*v),
+            return match self.condition_operand(tokens[0])? {
+                Value::Boolean(v) => Ok(v),
                 _ => Err(Error::message("condition must be boolean")),
             };
         }
         Err(Error::message("invalid condition expression"))
+    }
+
+    fn condition_operand(&self, source: &str) -> Result<Value> {
+        if !source.starts_with(['\'', '"'])
+            && let Ok(value) = lookup(&self.variables, source)
+        {
+            return Ok(value.clone());
+        }
+        self.eval_value(source)
+    }
+
+    fn is_expression(&self, source: &str) -> Result<bool> {
+        let tokens = argument_sources(source)?;
+        if tokens
+            .first()
+            .is_some_and(|token| *token == "exists" || *token == "not")
+        {
+            return Ok(true);
+        }
+        let typed = |token: &str| {
+            token.starts_with(['\'', '"'])
+                || token.starts_with("${")
+                || token == "true"
+                || token == "false"
+                || token.parse::<i64>().is_ok()
+                || lookup(&self.variables, token).is_ok()
+        };
+        if tokens.len() == 1 && typed(tokens[0]) {
+            return Ok(true);
+        }
+        if tokens.len() >= 3
+            && ["==", "!=", "<", "<=", ">", ">="].contains(&tokens[1])
+            && (typed(tokens[0]) || typed(tokens[2]))
+        {
+            return Ok(true);
+        }
+        Ok(tokens.iter().any(|token| *token == "and" || *token == "or")
+            && tokens.first().is_some_and(|token| typed(token)))
     }
 
     fn invocation(&self, source: &str) -> Result<Invocation> {
@@ -1081,11 +1190,7 @@ impl Invocation {
                     };
                 }
                 let path = resolve(context.cwd(), path);
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        Error::io("create redirect parent directories", Some(parent.into()), e)
-                    })?;
-                }
+                files::create_parent(&path)?;
                 match kind {
                     RedirectKind::Stdout => {
                         std::fs::write(&path, &output.stdout)
@@ -1135,6 +1240,33 @@ fn resolve(base: &Path, path: &str) -> PathBuf {
         base.join(path)
     }
 }
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create_new(path)
+}
 fn script_error(line: usize, message: impl Into<String>) -> Error {
     Error::Script {
         line,
@@ -1146,17 +1278,6 @@ fn attach_line(line: usize, error: Error) -> Error {
         Error::Script { .. } => error,
         other => script_error(line, other.to_string()),
     }
-}
-
-fn is_expression(source: &str) -> bool {
-    let padded = format!(" {source} ");
-    source.starts_with("exists ")
-        || source.starts_with("not ")
-        || [
-            " == ", " != ", " < ", " <= ", " > ", " >= ", " and ", " or ",
-        ]
-        .iter()
-        .any(|operator| padded.contains(operator))
 }
 
 fn logical_lines(source: &str) -> Result<Vec<(usize, String)>> {
@@ -1636,6 +1757,11 @@ fn extract_input(line: &str) -> Result<(&str, Option<(bool, &str)>)> {
                 continue;
             }
             let inline = bytes.get(index + 1) == Some(&b'<') && bytes.get(index + 2) == Some(&b'<');
+            if !inline && bytes.get(index + 1) == Some(&b'<') {
+                return Err(Error::message(
+                    "stdin redirection syntax: `< FILE` or `<<< VALUE`",
+                ));
+            }
             let length = if inline { 3 } else { 1 };
             let value = line[index + length..].trim();
             if value.is_empty() {

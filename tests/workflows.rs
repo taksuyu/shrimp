@@ -577,6 +577,7 @@ fn exists_and_integer_type_errors_are_explicit() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn rust_pipeline_accepts_explicit_stdin_bytes() {
     let output = cmd("cat")
@@ -739,5 +740,124 @@ fn file_metadata_produces_integer_values() {
         .run(&Context::new(&root))
         .unwrap();
     assert_eq!(std::fs::read_to_string(root.join("result")).unwrap(), "5");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_conditions_preserve_quotes_whitespace_and_nested_lookup() {
+    let root = sandbox("condition-token-metadata");
+    let source = r#"
+        let ready = true
+        let name = "two words"
+        record row tsv "10" fields size
+        if "4" != 4 and "true" != true and name == "two words" and row.size == "10" and ready
+          write "result" <- correct
+        else
+          write "result" <- wrong
+        end
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "correct"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn command_conditions_ignore_quoted_operators_and_output_redirects() {
+    let root = sandbox("command-condition-classification");
+    let source = r#"
+        if printf "a and b"
+          write "quoted" <- yes
+        end
+        if sh -c "exit 0" > "condition-output"
+          write "redirected" <- yes
+        end
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert!(root.join("quoted").exists());
+    assert!(root.join("redirected").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn functions_retain_their_include_directory_for_deferred_includes() {
+    let root = sandbox("deferred-include-directory");
+    std::fs::create_dir_all(root.join("lib/nested")).unwrap();
+    std::fs::write(
+        root.join("lib/functions.shrimp"),
+        "fn load\n  include \"nested/value.shrimp\"\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("lib/nested/value.shrimp"),
+        "write \"loaded\" <- yes\n",
+    )
+    .unwrap();
+    shrimp::Script::parse("include \"lib/functions.shrimp\"\ncall load\n")
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(root.join("loaded")).unwrap(), "yes");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn parallel_branches_share_include_once_state() {
+    let root = sandbox("parallel-include-once");
+    std::fs::write(
+        root.join("setup.shrimp"),
+        "append \"loaded\" <- x\nlet prefix = shared\nfn mark name\n  write \"${prefix}-${name}\" <- yes\nend\n",
+    )
+    .unwrap();
+    shrimp::Script::parse(
+        "parallel for item in words \"left right\" limit 2\n  include \"setup.shrimp\"\n  call mark \"${item}\"\nend\n",
+    )
+    .unwrap()
+    .run(&Context::new(&root))
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(root.join("loaded")).unwrap(), "x");
+    assert!(root.join("shared-left").exists());
+    assert!(root.join("shared-right").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn malformed_double_less_than_redirection_is_rejected() {
+    let error = shrimp::Script::parse("$ tool << input\n")
+        .unwrap()
+        .run(&Context::default())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("`< FILE` or `<<< VALUE`"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("script line 1"), "{error}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_temporary_paths_have_private_permissions() {
+    let root = sandbox("temporary-permissions");
+    let workflow = shrimp::Script::parse(
+        "temp_file file\ntemp_dir directory\n$ sh -c \"stat -c %a $1 > file-mode\" _ \"${file}\"\n$ sh -c \"stat -c %a $1 > dir-mode\" _ \"${directory}\"\n",
+    ).unwrap();
+    workflow.run(&Context::new(&root)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("file-mode")).unwrap(),
+        "600\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dir-mode")).unwrap(),
+        "700\n"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

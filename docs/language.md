@@ -106,8 +106,9 @@ modified_time changed_at <- "artifact.tar.gz"
 Temporary statements bind an absolute string path and create it immediately. All
 temporary paths are removed at workflow completion, including error completion;
 parallel branches share the cleanup registry. Dry-run assigns a planned path but does
-not create it. `file_size` returns bytes as an integer. `modified_time` returns whole
-seconds since the Unix epoch as an integer and rejects pre-epoch or overflowing values.
+not create it. On Unix, managed files use mode `0600` and directories use `0700`.
+`file_size` returns bytes as an integer. `modified_time` returns whole seconds since
+the Unix epoch as an integer and rejects pre-epoch or overflowing values.
 
 ## Matching
 
@@ -259,6 +260,10 @@ hidden. A path is resolved relative to the source file containing that include, 
 the process launch directory or a prior `cd` statement. Nested includes follow the
 same rule. Canonical files load once per workflow, cycles fail explicitly, and an
 included parse/runtime error names the included file and retains line diagnostics.
+Functions retain their defining source directory, so an include deferred inside a
+function follows the same relative-path rule. Parallel runtimes share include state:
+top-level effects execute once, while exported bindings and functions are copied into
+each branch that requests the already-loaded file.
 
 This is source composition, not a module/package system: it provides no namespace,
 export list, implicit search path, remote source, version selection, or isolation.
