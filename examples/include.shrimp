@@ -1,0 +1,2 @@
+include "lib/messages.shrimp"
+call announce "target/package.tar.gz"

@@ -27,6 +27,7 @@ pub fn write(path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> Task<()>
     let contents = contents.into();
     Task::new(move |ctx| {
         let path = ctx.cwd().join(&path);
+        create_parent(&path)?;
         io("write", &path, std::fs::write(&path, &contents))
     })
 }
@@ -43,6 +44,7 @@ pub fn copy(from: impl Into<PathBuf>, to: impl Into<PathBuf>) -> Task<u64> {
     Task::new(move |ctx| {
         let from = ctx.cwd().join(&from);
         let to = ctx.cwd().join(&to);
+        create_parent(&to)?;
         io("copy", &to, std::fs::copy(from, &to))
     })
 }
@@ -62,6 +64,7 @@ pub fn write_atomic(path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> T
     let contents = contents.into();
     Task::new(move |ctx| {
         let path = ctx.cwd().join(&path);
+        create_parent(&path)?;
         let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let temp = path.with_extension(format!("shrimp-{}-{id}.tmp", std::process::id()));
         io(
@@ -75,6 +78,17 @@ pub fn write_atomic(path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> T
         }
         Ok(())
     })
+}
+
+pub(crate) fn create_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        io(
+            "create parent directories",
+            parent,
+            std::fs::create_dir_all(parent),
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
