@@ -13,12 +13,16 @@ When review or testing identifies an agent-authored defect:
    defect, or a finding that does not reproduce.
 4. Prefer scanners/parsers that preserve syntax metadata over lossy split-and-reparse
    passes. Audit quoting, nesting, interpolation, redirects, and malformed near-misses.
+   Extend the configurable quote-aware delimiter scanner for new syntax; do not use
+   raw `contains`, `find`, or `split_once` to recognize language delimiters.
 5. For cloned parallel runtimes, explicitly classify every field as branch-local or
    workflow-shared and test the chosen behavior under concurrency.
 6. Any path or filename derived from workflow data is untrusted. Test containment,
    traversal, permissions, cleanup on failure, and platform-specific behavior.
 7. Run formatting, the complete test suite, Clippy with warnings denied, and relevant
    examples before committing.
+8. Pass Markdown or other untrusted text to CLIs through a single-quoted heredoc or a
+   file. Never embed backticks or expansion syntax in a double-quoted shell argument.
 
 Keep the ledger factual and compact. Its counts are engineering feedback, not a score;
 do not combine unrelated defects merely to reduce a count or split one defect to

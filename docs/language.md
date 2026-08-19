@@ -67,6 +67,9 @@ both streams are emitted. `> path` replaces stdout, `>> path` appends stdout, an
 scalar's UTF-8 bytes. Input can be combined with a following output redirect. It is
 valid on ordinary commands, capture, retry, and timeout statements. No shell parsing,
 word splitting, command substitution, or implicit encoding conversion is involved.
+An early child exit may close stdin before all input is written; that ordinary broken
+pipe is ignored and command status remains authoritative. Any other stdin write error
+fails the command or timed pipeline instead of silently accepting truncated input.
 
 Per-invocation environment overrides use an explicit prefix:
 

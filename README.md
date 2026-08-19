@@ -254,7 +254,7 @@ call publish "target/package.tar.gz"
 
 An included UTF-8 file is parsed and executed directly, so its function definitions
 and top-level bindings become available to the caller and its explicit effects remain
-effects. Paths are relative to the file containing the `include`, nested includes work
+visible. Paths are relative to the file containing the `include`, nested includes work
 the same way, and each canonical file is loaded once per workflow. Include cycles and
 errors in included files name the relevant file. There are no namespaces, implicit
 search paths, remote imports, package resolution, or compatibility/version metadata.

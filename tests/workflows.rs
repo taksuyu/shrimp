@@ -861,3 +861,112 @@ fn managed_temporary_paths_have_private_permissions() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn quoted_call_delimiters_are_arguments_not_assignment_operators() {
+    let root = sandbox("quoted-call-delimiter");
+    let source = r#"
+        fn notify message
+          value ${message}
+        end
+        call notify "a <- b"
+        call result <- notify "c <- d"
+        write "result" <- "${result}"
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "c <- d"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn configurable_delimiter_scanner_ignores_delimiters_inside_values() {
+    let root = sandbox("configurable-delimiters");
+    let source = r#"
+        record row tsv "a fields b" fields text
+        for item in lines "x in y"
+          write "result" <- "${row.text}:${item}"
+        end
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "a fields b:x in y"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn comment_delimiter_stops_quote_scanning_for_ignored_text() {
+    shrimp::Script::parse("# author's ignored apostrophe\nlet value = ok\n").unwrap();
+}
+
+#[test]
+fn included_parallel_workers_can_load_new_nested_includes() {
+    let root = sandbox("nested-parallel-includes");
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(
+        root.join("lib/root.shrimp"),
+        "parallel\n  include \"left.shrimp\"\n  include \"right.shrimp\"\nend\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("lib/left.shrimp"), "write \"left\" <- yes\n").unwrap();
+    std::fs::write(root.join("lib/right.shrimp"), "write \"right\" <- yes\n").unwrap();
+    let script = shrimp::Script::parse("include \"lib/root.shrimp\"\n").unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let context = Context::new(&root);
+    std::thread::spawn(move || sender.send(script.run(&context)).unwrap());
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("nested parallel includes deadlocked")
+        .unwrap();
+    assert!(root.join("left").exists());
+    assert!(root.join("right").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cross_thread_include_cycles_fail_instead_of_deadlocking() {
+    let root = sandbox("parallel-include-cycle");
+    std::fs::write(root.join("left.shrimp"), "include \"right.shrimp\"\n").unwrap();
+    std::fs::write(root.join("right.shrimp"), "include \"left.shrimp\"\n").unwrap();
+    let script = shrimp::Script::parse(
+        "parallel\n  include \"left.shrimp\"\n  include \"right.shrimp\"\nend\n",
+    )
+    .unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let context = Context::new(&root);
+    std::thread::spawn(move || sender.send(script.run(&context)).unwrap());
+    let error = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("parallel include cycle deadlocked")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("include cycle detected"),
+        "{error}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn early_stdin_close_is_treated_as_broken_pipe_not_failure() {
+    cmd("true")
+        .pipeline()
+        .stdin(vec![b'x'; 1024 * 1024])
+        .run(&Context::default())
+        .unwrap();
+    cmd("true")
+        .pipeline()
+        .stdin(vec![b'x'; 1024 * 1024])
+        .run_timeout(&Context::default(), Duration::from_secs(1))
+        .unwrap();
+}

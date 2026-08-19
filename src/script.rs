@@ -80,9 +80,8 @@ struct FunctionDefinition {
 #[derive(Default)]
 struct IncludeRegistry {
     loaded: HashMap<PathBuf, IncludeExports>,
-    active: HashSet<PathBuf>,
-    owner: Option<thread::ThreadId>,
-    depth: usize,
+    active: HashMap<PathBuf, thread::ThreadId>,
+    waiting: HashMap<thread::ThreadId, PathBuf>,
 }
 
 #[derive(Clone, Default)]
@@ -90,6 +89,27 @@ struct IncludeExports {
     variables: HashMap<String, Value>,
     functions: HashMap<String, FunctionDefinition>,
     secrets: HashSet<String>,
+}
+
+fn include_wait_would_cycle(
+    registry: &IncludeRegistry,
+    current: thread::ThreadId,
+    mut owner: thread::ThreadId,
+) -> bool {
+    let mut visited = HashSet::new();
+    while visited.insert(owner) {
+        let Some(waited_path) = registry.waiting.get(&owner) else {
+            return false;
+        };
+        let Some(next_owner) = registry.active.get(waited_path).copied() else {
+            return false;
+        };
+        if next_owner == current {
+            return true;
+        }
+        owner = next_owner;
+    }
+    false
 }
 
 #[derive(Clone, Debug)]
@@ -881,19 +901,21 @@ impl Runtime {
                 self.secrets.extend(exports.secrets);
                 return Ok(());
             }
-            if registry.owner.is_some_and(|owner| owner != current_thread) {
-                drop(changed.wait(registry).expect("include registry poisoned"));
+            if let Some(owner) = registry.active.get(&path).copied() {
+                if owner == current_thread
+                    || include_wait_would_cycle(&registry, current_thread, owner)
+                {
+                    return Err(Error::message(format!(
+                        "include cycle detected at {}",
+                        path.display()
+                    )));
+                }
+                registry.waiting.insert(current_thread, path.clone());
+                let mut registry = changed.wait(registry).expect("include registry poisoned");
+                registry.waiting.remove(&current_thread);
                 continue;
             }
-            if registry.active.contains(&path) {
-                return Err(Error::message(format!(
-                    "include cycle detected at {}",
-                    path.display()
-                )));
-            }
-            registry.owner = Some(current_thread);
-            registry.depth += 1;
-            registry.active.insert(path.clone());
+            registry.active.insert(path.clone(), current_thread);
             break;
         }
         let variables_before = self.variables.clone();
@@ -915,10 +937,6 @@ impl Runtime {
         })();
         let mut registry = lock.lock().expect("include registry poisoned");
         registry.active.remove(&path);
-        registry.depth -= 1;
-        if registry.depth == 0 {
-            registry.owner = None;
-        }
         if result.is_ok() {
             let variables = self
                 .variables
@@ -1073,7 +1091,7 @@ impl Runtime {
 
     fn invocation(&self, source: &str) -> Result<Invocation> {
         let (environment, source) = if let Some(rest) = source.strip_prefix("env ") {
-            let (bindings, command) = rest.split_once(" $ ").ok_or_else(|| {
+            let (bindings, command) = split_operator(rest, " $ ").map_err(|_| {
                 Error::message("environment override syntax: env NAME=VALUE $ command")
             })?;
             let bindings = words(bindings, &self.variables)?
@@ -1285,7 +1303,9 @@ fn logical_lines(source: &str) -> Result<Vec<(usize, String)>> {
     let mut pending = String::new();
     let mut start = 0;
     for (index, raw) in source.lines().enumerate() {
-        let line = strip_comment(raw).trim();
+        let line = strip_comment(raw)
+            .map_err(|error| attach_line(index + 1, error))?
+            .trim();
         if line.is_empty() && pending.is_empty() {
             continue;
         }
@@ -1389,7 +1409,7 @@ fn parse_block(
                 no,
             }
         } else if let Some(rest) = text.strip_prefix("for ") {
-            let (name, source) = rest.split_once(" in ").ok_or_else(|| {
+            let (name, source) = split_operator_optional(rest, " in ")?.ok_or_else(|| {
                 script_error(*line, "for syntax: for NAME in glob|lines|words VALUE")
             })?;
             valid_name(name)?;
@@ -1415,13 +1435,13 @@ fn parse_block(
                 body,
             }
         } else if let Some(rest) = text.strip_prefix("parallel for ") {
-            let (loop_part, limit) = rest.rsplit_once(" limit ").ok_or_else(|| {
+            let (loop_part, limit) = split_operator_last(rest, " limit ")?.ok_or_else(|| {
                 script_error(
                     *line,
                     "parallel for syntax: parallel for NAME in SOURCE VALUE limit COUNT",
                 )
             })?;
-            let (name, source) = loop_part.split_once(" in ").ok_or_else(|| {
+            let (name, source) = split_operator_optional(loop_part, " in ")?.ok_or_else(|| {
                 script_error(
                     *line,
                     "parallel for syntax: parallel for NAME in SOURCE VALUE limit COUNT",
@@ -1574,10 +1594,10 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
             StatementKind::Remove(v.into())
         }
     } else if let Some(rest) = text.strip_prefix("record ") {
-        let (definition, fields) = rest.split_once(" fields ").ok_or_else(|| {
+        let (definition, fields) = split_operator_optional(rest, " fields ")?.ok_or_else(|| {
             script_error(line, "record syntax: record NAME tsv VALUE fields FIELD...")
         })?;
-        let (name, value) = definition.split_once(" tsv ").ok_or_else(|| {
+        let (name, value) = split_operator_optional(definition, " tsv ")?.ok_or_else(|| {
             script_error(line, "record syntax: record NAME tsv VALUE fields FIELD...")
         })?;
         valid_name(name)?;
@@ -1636,13 +1656,13 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
             modified: true,
         }
     } else if let Some(rest) = text.strip_prefix("call ") {
-        let (target, invocation) = if rest.contains("<-") {
-            let (target, invocation) = split_operator(rest, "<-")?;
-            valid_name(target)?;
-            (Some(target.into()), invocation)
-        } else {
-            (None, rest)
-        };
+        let (target, invocation) =
+            if let Some((target, invocation)) = split_operator_optional(rest, "<-")? {
+                valid_name(target)?;
+                (Some(target.into()), invocation)
+            } else {
+                (None, rest)
+            };
         let (name, args) = invocation.split_once(' ').unwrap_or((invocation, ""));
         valid_name(name)?;
         StatementKind::Call {
@@ -1682,9 +1702,65 @@ fn parse_duration(value: &str) -> Result<Duration> {
     }
 }
 fn split_operator<'a>(value: &'a str, delimiter: &str) -> Result<(&'a str, &'a str)> {
+    split_operator_optional(value, delimiter)?
+        .ok_or_else(|| Error::message(format!("expected `{delimiter}`")))
+}
+
+fn split_operator_optional<'a>(
+    value: &'a str,
+    delimiter: &str,
+) -> Result<Option<(&'a str, &'a str)>> {
+    Ok(scan_delimiters(value, &[delimiter])?.first().map(|found| {
+        (
+            value[..found.index].trim(),
+            value[found.index + found.delimiter.len()..].trim(),
+        )
+    }))
+}
+
+fn split_operator_last<'a>(value: &'a str, delimiter: &str) -> Result<Option<(&'a str, &'a str)>> {
+    Ok(scan_delimiters(value, &[delimiter])?.last().map(|found| {
+        (
+            value[..found.index].trim(),
+            value[found.index + found.delimiter.len()..].trim(),
+        )
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct DelimiterMatch<'a> {
+    index: usize,
+    delimiter: &'a str,
+}
+
+/// Finds configurable delimiters outside quotes in one quote-aware pass.
+/// The longest matching delimiter wins when delimiters share a prefix.
+fn scan_delimiters<'a>(source: &str, delimiters: &[&'a str]) -> Result<Vec<DelimiterMatch<'a>>> {
+    scan_delimiters_with_mode(source, delimiters, false)
+}
+
+fn scan_first_delimiter<'a>(
+    source: &str,
+    delimiters: &[&'a str],
+) -> Result<Option<DelimiterMatch<'a>>> {
+    Ok(scan_delimiters_with_mode(source, delimiters, true)?
+        .into_iter()
+        .next())
+}
+
+fn scan_delimiters_with_mode<'a>(
+    source: &str,
+    delimiters: &[&'a str],
+    stop_at_first: bool,
+) -> Result<Vec<DelimiterMatch<'a>>> {
+    let mut matches = Vec::new();
     let mut quote = None;
     let mut escaped = false;
-    for (index, character) in value.char_indices() {
+    let mut skip_until = 0;
+    for (index, character) in source.char_indices() {
+        if index < skip_until {
+            continue;
+        }
         if escaped {
             escaped = false;
             continue;
@@ -1701,14 +1777,24 @@ fn split_operator<'a>(value: &'a str, delimiter: &str) -> Result<(&'a str, &'a s
             }
             continue;
         }
-        if quote.is_none() && value[index..].starts_with(delimiter) {
-            return Ok((
-                value[..index].trim(),
-                value[index + delimiter.len()..].trim(),
-            ));
+        if quote.is_none()
+            && let Some(delimiter) = delimiters
+                .iter()
+                .copied()
+                .filter(|delimiter| source[index..].starts_with(delimiter))
+                .max_by_key(|delimiter| delimiter.len())
+        {
+            matches.push(DelimiterMatch { index, delimiter });
+            if stop_at_first {
+                return Ok(matches);
+            }
+            skip_until = index + delimiter.len();
         }
     }
-    Err(Error::message(format!("expected `{delimiter}`")))
+    if quote.is_some() {
+        return Err(Error::message("unclosed quote"));
+    }
+    Ok(matches)
 }
 fn valid_name(name: &str) -> Result<()> {
     if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -1732,145 +1818,55 @@ fn valid_env_name(name: &str) -> Result<()> {
 
 /// Extracts one stdin source after output redirection has been removed.
 fn extract_input(line: &str) -> Result<(&str, Option<(bool, &str)>)> {
-    let mut quote = None;
-    let mut escaped = false;
-    let bytes = line.as_bytes();
-    for (index, character) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
+    let found = scan_delimiters(line, &["<", "<-", "<<", "<<<"])?
+        .into_iter()
+        .find(|found| found.delimiter != "<-");
+    if let Some(found) = found {
+        if found.delimiter == "<<" {
+            return Err(Error::message(
+                "stdin redirection syntax: `< FILE` or `<<< VALUE`",
+            ));
         }
-        if character == '\\' {
-            escaped = true;
-            continue;
+        let value = line[found.index + found.delimiter.len()..].trim();
+        if value.is_empty() {
+            return Err(Error::message("stdin redirection needs a file or value"));
         }
-        if character == '\'' || character == '"' {
-            if quote == Some(character) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(character);
-            }
-            continue;
-        }
-        if quote.is_none() && character == '<' {
-            if bytes.get(index + 1) == Some(&b'-') {
-                continue;
-            }
-            let inline = bytes.get(index + 1) == Some(&b'<') && bytes.get(index + 2) == Some(&b'<');
-            if !inline && bytes.get(index + 1) == Some(&b'<') {
-                return Err(Error::message(
-                    "stdin redirection syntax: `< FILE` or `<<< VALUE`",
-                ));
-            }
-            let length = if inline { 3 } else { 1 };
-            let value = line[index + length..].trim();
-            if value.is_empty() {
-                return Err(Error::message("stdin redirection needs a file or value"));
-            }
-            return Ok((line[..index].trim(), Some((inline, value))));
-        }
+        return Ok((
+            line[..found.index].trim(),
+            Some((found.delimiter == "<<<", value)),
+        ));
     }
     Ok((line, None))
 }
 
 fn extract_redirect(line: &str) -> Result<(&str, Option<(RedirectKind, &str)>)> {
-    let mut quote = None;
-    let mut escaped = false;
-    let mut found = None;
-    let mut characters = line.char_indices().peekable();
-    while let Some((index, character)) = characters.next() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' {
-            escaped = true;
-            continue;
-        }
-        if character == '\'' || character == '"' {
-            if quote == Some(character) {
-                quote = None
-            } else if quote.is_none() {
-                quote = Some(character)
-            };
-            continue;
-        }
-        if quote.is_none() {
-            let next = characters.peek().map(|(_, next)| *next);
-            let (kind, len) = if character == '2' && next == Some('>') {
-                (Some(RedirectKind::Stderr), 2)
-            } else if character == '>' && next == Some('>') {
-                (Some(RedirectKind::Append), 2)
-            } else if character == '>' {
-                (Some(RedirectKind::Stdout), 1)
-            } else {
-                (None, 0)
-            };
-            if let Some(kind) = kind {
-                found = Some((index, kind, len));
-                break;
-            }
-        }
-    }
-    if let Some((index, kind, len)) = found {
-        let path = line[index + len..].trim();
+    if let Some(found) = scan_delimiters(line, &[">", ">>", "2>"])?
+        .into_iter()
+        .next()
+    {
+        let kind = match found.delimiter {
+            "2>" => RedirectKind::Stderr,
+            ">>" => RedirectKind::Append,
+            _ => RedirectKind::Stdout,
+        };
+        let path = line[found.index + found.delimiter.len()..].trim();
         if path.is_empty() {
             return Err(Error::message("redirection needs a path"));
         }
-        Ok((line[..index].trim(), Some((kind, path))))
+        Ok((line[..found.index].trim(), Some((kind, path))))
     } else {
         Ok((line, None))
     }
 }
-fn strip_comment(line: &str) -> &str {
-    let mut quote = None;
-    let mut escaped = false;
-    for (i, c) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if c == '\\' {
-            escaped = true;
-            continue;
-        }
-        if c == '\'' || c == '"' {
-            if quote == Some(c) {
-                quote = None
-            } else if quote.is_none() {
-                quote = Some(c)
-            }
-        } else if c == '#' && quote.is_none() {
-            return &line[..i];
-        }
-    }
-    line
+fn strip_comment(line: &str) -> Result<&str> {
+    Ok(scan_first_delimiter(line, &["#"])?.map_or(line, |found| &line[..found.index]))
 }
 fn split_pipeline(line: &str) -> Result<Vec<&str>> {
     let mut result = Vec::new();
     let mut start = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    for (i, c) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if c == '\\' {
-            escaped = true
-        } else if c == '\'' || c == '"' {
-            if quote == Some(c) {
-                quote = None
-            } else if quote.is_none() {
-                quote = Some(c)
-            }
-        } else if c == '|' && quote.is_none() {
-            result.push(line[start..i].trim());
-            start = i + 1
-        }
-    }
-    if quote.is_some() {
-        return Err(Error::message("unclosed quote"));
+    for found in scan_delimiters(line, &["|"])? {
+        result.push(line[start..found.index].trim());
+        start = found.index + found.delimiter.len();
     }
     result.push(line[start..].trim());
     Ok(result)
