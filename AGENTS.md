@@ -15,6 +15,8 @@ When review or testing identifies an agent-authored defect:
    passes. Audit quoting, nesting, interpolation, redirects, and malformed near-misses.
    Extend the configurable quote-aware delimiter scanner for new syntax; do not use
    raw `contains`, `find`, or `split_once` to recognize language delimiters.
+   Keep lexing separate from contextual operation mapping: recognizing a token does not
+   imply every parser context supports an operation for it. Preserve ignored tokens.
 5. For cloned parallel runtimes, explicitly classify every field as branch-local or
    workflow-shared and test the chosen behavior under concurrency.
 6. Any path or filename derived from workflow data is untrusted. Test containment,

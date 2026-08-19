@@ -906,7 +906,15 @@ fn configurable_delimiter_scanner_ignores_delimiters_inside_values() {
 
 #[test]
 fn comment_delimiter_stops_quote_scanning_for_ignored_text() {
-    shrimp::Script::parse("# author's ignored apostrophe\nlet value = ok\n").unwrap();
+    let root = sandbox("comment-tokens");
+    let source =
+        "let value = ok # author's ignored <- | << tokens\nwrite \"result\" <- \"${value}\"\n";
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(root.join("result")).unwrap(), "ok");
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

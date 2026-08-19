@@ -1180,6 +1180,16 @@ enum RedirectKind {
     Append,
     Stderr,
 }
+impl RedirectKind {
+    fn from_delimiter(delimiter: &str) -> Option<Self> {
+        match delimiter {
+            ">" => Some(Self::Stdout),
+            ">>" => Some(Self::Append),
+            "2>" => Some(Self::Stderr),
+            _ => None,
+        }
+    }
+}
 struct Invocation {
     pipeline: Pipeline,
     redirect: Option<(RedirectKind, String)>,
@@ -1733,40 +1743,44 @@ struct DelimiterMatch<'a> {
     delimiter: &'a str,
 }
 
-/// Finds configurable delimiters outside quotes in one quote-aware pass.
-/// The longest matching delimiter wins when delimiters share a prefix.
-fn scan_delimiters<'a>(source: &str, delimiters: &[&'a str]) -> Result<Vec<DelimiterMatch<'a>>> {
-    scan_delimiters_with_mode(source, delimiters, false)
+#[derive(Clone, Copy)]
+enum SyntaxTokenKind<'a> {
+    Text,
+    Delimiter(&'a str),
+    Comment,
 }
 
-fn scan_first_delimiter<'a>(
-    source: &str,
-    delimiters: &[&'a str],
-) -> Result<Option<DelimiterMatch<'a>>> {
-    Ok(scan_delimiters_with_mode(source, delimiters, true)?
-        .into_iter()
-        .next())
+#[derive(Clone, Copy)]
+struct SyntaxToken<'a> {
+    start: usize,
+    end: usize,
+    kind: SyntaxTokenKind<'a>,
 }
 
-fn scan_delimiters_with_mode<'a>(
+/// Tokenizes text, configurable delimiters, and an optional line-comment delimiter.
+/// The longest delimiter wins when forms share a prefix. Comment payload remains a
+/// token so later phases may retain it, although execution currently ignores it.
+fn tokenize_syntax<'a>(
     source: &str,
     delimiters: &[&'a str],
-    stop_at_first: bool,
-) -> Result<Vec<DelimiterMatch<'a>>> {
-    let mut matches = Vec::new();
+    comment_delimiter: Option<&'a str>,
+) -> Result<Vec<SyntaxToken<'a>>> {
+    let positions: Vec<_> = source.char_indices().collect();
+    let mut tokens = Vec::new();
     let mut quote = None;
     let mut escaped = false;
-    let mut skip_until = 0;
-    for (index, character) in source.char_indices() {
-        if index < skip_until {
-            continue;
-        }
+    let mut text_start = 0;
+    let mut position = 0;
+    while position < positions.len() {
+        let (index, character) = positions[position];
         if escaped {
             escaped = false;
+            position += 1;
             continue;
         }
         if character == '\\' {
             escaped = true;
+            position += 1;
             continue;
         }
         if character == '\'' || character == '"' {
@@ -1775,26 +1789,80 @@ fn scan_delimiters_with_mode<'a>(
             } else if quote.is_none() {
                 quote = Some(character);
             }
+            position += 1;
             continue;
         }
-        if quote.is_none()
-            && let Some(delimiter) = delimiters
+        if quote.is_none() {
+            if let Some(comment) = comment_delimiter
+                && source[index..].starts_with(comment)
+            {
+                if text_start < index {
+                    tokens.push(SyntaxToken {
+                        start: text_start,
+                        end: index,
+                        kind: SyntaxTokenKind::Text,
+                    });
+                }
+                tokens.push(SyntaxToken {
+                    start: index,
+                    end: source.len(),
+                    kind: SyntaxTokenKind::Comment,
+                });
+                return Ok(tokens);
+            }
+            if let Some(delimiter) = delimiters
                 .iter()
                 .copied()
                 .filter(|delimiter| source[index..].starts_with(delimiter))
                 .max_by_key(|delimiter| delimiter.len())
-        {
-            matches.push(DelimiterMatch { index, delimiter });
-            if stop_at_first {
-                return Ok(matches);
+            {
+                if text_start < index {
+                    tokens.push(SyntaxToken {
+                        start: text_start,
+                        end: index,
+                        kind: SyntaxTokenKind::Text,
+                    });
+                }
+                let end = index + delimiter.len();
+                tokens.push(SyntaxToken {
+                    start: index,
+                    end,
+                    kind: SyntaxTokenKind::Delimiter(delimiter),
+                });
+                position += 1;
+                while position < positions.len() && positions[position].0 < end {
+                    position += 1;
+                }
+                text_start = end;
+                continue;
             }
-            skip_until = index + delimiter.len();
         }
+        position += 1;
     }
     if quote.is_some() {
         return Err(Error::message("unclosed quote"));
     }
-    Ok(matches)
+    if text_start < source.len() {
+        tokens.push(SyntaxToken {
+            start: text_start,
+            end: source.len(),
+            kind: SyntaxTokenKind::Text,
+        });
+    }
+    Ok(tokens)
+}
+
+fn scan_delimiters<'a>(source: &str, delimiters: &[&'a str]) -> Result<Vec<DelimiterMatch<'a>>> {
+    Ok(tokenize_syntax(source, delimiters, None)?
+        .into_iter()
+        .filter_map(|token| match token.kind {
+            SyntaxTokenKind::Delimiter(delimiter) => Some(DelimiterMatch {
+                index: token.start,
+                delimiter,
+            }),
+            SyntaxTokenKind::Text | SyntaxTokenKind::Comment => None,
+        })
+        .collect())
 }
 fn valid_name(name: &str) -> Result<()> {
     if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -1822,19 +1890,21 @@ fn extract_input(line: &str) -> Result<(&str, Option<(bool, &str)>)> {
         .into_iter()
         .find(|found| found.delimiter != "<-");
     if let Some(found) = found {
-        if found.delimiter == "<<" {
-            return Err(Error::message(
-                "stdin redirection syntax: `< FILE` or `<<< VALUE`",
-            ));
-        }
+        let inline = match found.delimiter {
+            "<" => false,
+            "<<<" => true,
+            "<<" => {
+                return Err(Error::message(
+                    "stdin redirection syntax: `< FILE` or `<<< VALUE`; `<<` has no operation",
+                ));
+            }
+            _ => unreachable!("filtered assignment delimiter"),
+        };
         let value = line[found.index + found.delimiter.len()..].trim();
         if value.is_empty() {
             return Err(Error::message("stdin redirection needs a file or value"));
         }
-        return Ok((
-            line[..found.index].trim(),
-            Some((found.delimiter == "<<<", value)),
-        ));
+        return Ok((line[..found.index].trim(), Some((inline, value))));
     }
     Ok((line, None))
 }
@@ -1844,11 +1914,8 @@ fn extract_redirect(line: &str) -> Result<(&str, Option<(RedirectKind, &str)>)> 
         .into_iter()
         .next()
     {
-        let kind = match found.delimiter {
-            "2>" => RedirectKind::Stderr,
-            ">>" => RedirectKind::Append,
-            _ => RedirectKind::Stdout,
-        };
+        let kind = RedirectKind::from_delimiter(found.delimiter)
+            .expect("scanner was configured with output operations");
         let path = line[found.index + found.delimiter.len()..].trim();
         if path.is_empty() {
             return Err(Error::message("redirection needs a path"));
@@ -1859,7 +1926,13 @@ fn extract_redirect(line: &str) -> Result<(&str, Option<(RedirectKind, &str)>)> 
     }
 }
 fn strip_comment(line: &str) -> Result<&str> {
-    Ok(scan_first_delimiter(line, &["#"])?.map_or(line, |found| &line[..found.index]))
+    Ok(tokenize_syntax(line, &[], Some("#"))?
+        .into_iter()
+        .find(|token| matches!(token.kind, SyntaxTokenKind::Comment))
+        .map_or(line, |comment| {
+            debug_assert_eq!(comment.end, line.len());
+            &line[..comment.start]
+        }))
 }
 fn split_pipeline(line: &str) -> Result<Vec<&str>> {
     let mut result = Vec::new();

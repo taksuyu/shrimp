@@ -14,6 +14,13 @@ Blank lines are ignored. `#` begins a comment outside quotes. A final backslash 
 the next physical line. Single quotes are literal; double quotes support `${name}` and
 the escapes `\n`, `\t`, `\\`, and escaped quotes. Expansions always remain one argument.
 
+The lexer emits comments and configured delimiters as tokens. Comment payload is
+currently ignored by execution, but it is not confused with quotes or operators.
+Delimiter recognition is separate from context-specific operations: for example `<`
+maps to file stdin, `<<<` maps to scalar stdin, and `<-` maps to assignment where that
+operation is valid. `<<` is recognized as a delimiter but rejected because Shrimp does
+not currently define a heredoc or multiline-input operation for it.
+
 ## Values
 
 ```shrimp
