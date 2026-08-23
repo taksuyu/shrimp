@@ -171,12 +171,15 @@ Implemented now:
 - stdout/stderr redirection and cancellable command timeouts;
 - secret-aware tracing and side-effect-free dry runs;
 - TSV records with named field access and string `match` branches;
-- recursive workspace removal and concurrency-bounded parallel loops.
+- recursive workspace removal and concurrency-bounded parallel loops;
+- typed values, typed conditions, list indexing, and typed function results;
+- explicit file/value stdin and per-command environment overrides;
+- managed temporary paths and integer file metadata.
 
 The initial language contract is documented in [`docs/language.md`](docs/language.md).
-Remaining production-hardening work includes Windows job-object cancellation, richer
-typed values beyond TSV records, explicit stdin redirection, file durability policy,
-and a compatibility/versioning policy once the syntax has had real-world use.
+Remaining production-hardening work includes Windows job-object cancellation, parallel
+write collision checks, file durability policy, and a compatibility/versioning policy
+once the syntax has had real-world use.
 
 ## Rust embedding API
 
@@ -196,3 +199,62 @@ For a more demanding side-by-side exercise, the
 [`examples/workspace-comparison`](examples/workspace-comparison/README.md) benchmark
 implements the same document-driven workspace build in Bash, Nushell, and Shrimp and
 uses a Makefile to compare their outputs and repeatability.
+
+## Typed workflow additions
+
+Shrimp's deliberately small value model contains strings, booleans, signed integers,
+lists, records, and an internal missing value. Bare `true`, `false`, and integer
+assignments are typed. `glob`, `lines`, and `words` produce lists when assigned; lists
+can be iterated (`for item in ${items}`) or indexed (`${items[0]}`). Records use named
+access (`${document.path}`). A whole list or record cannot be interpolated, avoiding
+an implicit joining or serialization convention.
+
+Workflow conditions support typed `==` and `!=`, integer `<`, `<=`, `>`, and `>=`,
+`and`, `or`, `not`, boolean variables, and `exists PATH`. Conditions without these
+markers remain direct command-status checks. Shrimp intentionally has no arithmetic or
+arbitrary expression evaluator.
+
+Writes, appends, copies, and redirection destinations create missing parents. The
+`--check` runner option parses without executing. Rust embedders may feed bytes directly
+to the first pipeline process with `Pipeline::stdin`.
+
+Still deliberately absent are function defaults, parallel same-path write detection,
+namespaced modules, and shell compatibility. These typed additions remain experimental
+and do not constitute a compatibility promise. The selected workflow additions stay small:
+
+```shrimp
+fn artifact_path name
+  value "target/${name}.tar.gz"
+end
+call artifact <- artifact_path "release"
+
+$ tool < "input.txt"
+$ tool <<< "${captured}" > "output.txt"
+env PROFILE="release" $ cargo build
+
+temp_file scratch
+temp_dir staging
+file_size bytes <- "output.txt"
+modified_time changed_at <- "output.txt"
+```
+
+Functions implicitly return their final statement value and accept typed arguments;
+there is no early-return control flow. Temporary paths are cleaned up when the workflow
+ends. Metadata values are integers. See the language reference for exact semantics and
+for a difficulty-ranked list of potential future work.
+
+## Reusable workflow files
+
+`include` is a deliberately smaller feature than a module system:
+
+```shrimp
+include "lib/release.shrimp"
+call publish "target/package.tar.gz"
+```
+
+An included UTF-8 file is parsed and executed directly, so its function definitions
+and top-level bindings become available to the caller and its explicit effects remain
+visible. Paths are relative to the file containing the `include`, nested includes work
+the same way, and each canonical file is loaded once per workflow. Include cycles and
+errors in included files name the relevant file. There are no namespaces, implicit
+search paths, remote imports, package resolution, or compatibility/version metadata.

@@ -11,11 +11,12 @@ mod task;
 
 pub use command::{Cmd, CommandOutput, Pipeline};
 pub use error::{Error, Result};
-pub use script::{Script, ScriptOptions, ScriptReport};
+pub use script::{Script, ScriptOptions, ScriptReport, Value};
 pub use task::{Context, Task};
 
 /// Filesystem operations lifted into reusable [`Task`] values.
 pub mod files {
+    pub(crate) use crate::fs::create_parent;
     pub use crate::fs::{
         copy, create_dir_all, read, read_to_string, remove_file, write, write_atomic,
     };
