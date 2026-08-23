@@ -50,11 +50,13 @@ impl Cmd {
     pub fn pipe(self, next: Cmd) -> Pipeline {
         Pipeline {
             commands: vec![self, next],
+            stdin: None,
         }
     }
     pub fn pipeline(self) -> Pipeline {
         Pipeline {
             commands: vec![self],
+            stdin: None,
         }
     }
     pub fn task(self) -> Task<CommandOutput> {
@@ -63,6 +65,7 @@ impl Cmd {
     pub fn run(&self, context: &Context) -> Result<CommandOutput> {
         Pipeline {
             commands: vec![self.clone()],
+            stdin: None,
         }
         .run(context)
     }
@@ -70,6 +73,7 @@ impl Cmd {
     pub fn run_unchecked(&self, context: &Context) -> Result<CommandOutput> {
         Pipeline {
             commands: vec![self.clone()],
+            stdin: None,
         }
         .run_unchecked(context)
     }
@@ -126,11 +130,17 @@ fn quote(value: &OsStr) -> String {
 #[derive(Clone, Debug)]
 pub struct Pipeline {
     commands: Vec<Cmd>,
+    stdin: Option<Vec<u8>>,
 }
 
 type PipelineFailure = (String, ExitStatus, Vec<u8>);
 
 impl Pipeline {
+    /// Feeds these bytes to the first process without invoking a shell.
+    pub fn stdin(mut self, input: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(input.into());
+        self
+    }
     pub fn pipe(mut self, next: Cmd) -> Self {
         self.commands.push(next);
         self
@@ -174,15 +184,18 @@ impl Pipeline {
         let mut previous_stdout = None;
         let mut final_stdout = None;
         let mut final_stderr = None;
+        let mut stdin_writer = None;
         for (index, specification) in self.commands.iter().enumerate() {
             let last = index + 1 == self.commands.len();
             let mut command = specification.command(context, true);
-            command.stdin(
+            command.stdin(if index == 0 && self.stdin.is_some() {
+                Stdio::piped()
+            } else {
                 previous_stdout
                     .take()
                     .map(Stdio::from)
-                    .unwrap_or_else(Stdio::null),
-            );
+                    .unwrap_or_else(Stdio::null)
+            });
             command.stdout(Stdio::piped()).stderr(if last {
                 Stdio::piped()
             } else {
@@ -198,6 +211,14 @@ impl Pipeline {
                     return Err(Error::io("spawn command", None, error));
                 }
             };
+            if index == 0
+                && let Some(input) = &self.stdin
+            {
+                stdin_writer = Some(spawn_stdin_writer(
+                    child.stdin.take().expect("piped stdin"),
+                    input.clone(),
+                ));
+            }
             if last {
                 final_stdout = child.stdout.take();
                 final_stderr = child.stderr.take();
@@ -211,6 +232,7 @@ impl Pipeline {
         let stderr_reader = spawn_reader(final_stderr);
         let mut stdout = None;
         let mut stderr = None;
+        let mut stdin_complete = stdin_writer.is_none();
         let started = Instant::now();
         loop {
             let mut running = false;
@@ -224,7 +246,16 @@ impl Pipeline {
             }
             poll_reader(&stdout_reader, &mut stdout)?;
             poll_reader(&stderr_reader, &mut stderr)?;
-            if !running && stdout.is_some() && stderr.is_some() {
+            if let Some(writer) = &stdin_writer
+                && let Err(error) = poll_stdin_writer(writer, &mut stdin_complete)
+            {
+                for (_, child, _) in &mut children {
+                    kill_process_tree(child);
+                    let _ = child.wait();
+                }
+                return Err(error);
+            }
+            if !running && stdout.is_some() && stderr.is_some() && stdin_complete {
                 break;
             }
             if started.elapsed() >= limit {
@@ -272,15 +303,18 @@ impl Pipeline {
         let mut children: Vec<(String, std::process::Child)> =
             Vec::with_capacity(self.commands.len());
         let mut previous_stdout = None;
+        let mut stdin_writer = None;
         for (index, specification) in self.commands.iter().enumerate() {
             let last = index + 1 == self.commands.len();
             let mut command = specification.command(context, false);
-            command.stdin(
+            command.stdin(if index == 0 && self.stdin.is_some() {
+                Stdio::piped()
+            } else {
                 previous_stdout
                     .take()
                     .map(Stdio::from)
-                    .unwrap_or_else(Stdio::null),
-            );
+                    .unwrap_or_else(Stdio::null)
+            });
             // Intermediate stderr is inherited so a noisy child cannot fill an
             // unread pipe and deadlock the pipeline. The final stderr is captured.
             command.stdout(Stdio::piped()).stderr(if last {
@@ -298,6 +332,14 @@ impl Pipeline {
                     return Err(Error::io("spawn command", None, error));
                 }
             };
+            if index == 0
+                && let Some(input) = &self.stdin
+            {
+                stdin_writer = Some(spawn_stdin_writer(
+                    child.stdin.take().expect("piped stdin"),
+                    input.clone(),
+                ));
+            }
             if !last {
                 previous_stdout = child.stdout.take();
             }
@@ -317,6 +359,9 @@ impl Pipeline {
             if failure.is_none() && !status.success() {
                 failure = Some((name, status, Vec::new()));
             }
+        }
+        if let Some(writer) = stdin_writer {
+            finish_stdin_writer(writer)?;
         }
         if let Some((command, status, stderr)) = failure {
             return Ok((
@@ -347,6 +392,45 @@ fn read_all<R: Read>(reader: Option<R>) -> Result<Vec<u8>> {
             .map_err(|e| Error::io("read command output", None, e))?;
     }
     Ok(output)
+}
+
+fn spawn_stdin_writer(mut stdin: std::process::ChildStdin, input: Vec<u8>) -> Receiver<Result<()>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        use std::io::Write as _;
+        let result = stdin.write_all(&input).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        });
+        let _ = sender.send(result.map_err(|error| Error::io("write command stdin", None, error)));
+    });
+    receiver
+}
+
+fn poll_stdin_writer(receiver: &Receiver<Result<()>>, complete: &mut bool) -> Result<()> {
+    if *complete {
+        return Ok(());
+    }
+    match receiver.try_recv() {
+        Ok(result) => {
+            result?;
+            *complete = true;
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            return Err(Error::message("command stdin writer stopped unexpectedly"));
+        }
+    }
+    Ok(())
+}
+
+fn finish_stdin_writer(receiver: Receiver<Result<()>>) -> Result<()> {
+    receiver
+        .recv()
+        .map_err(|_| Error::message("command stdin writer stopped unexpectedly"))?
 }
 
 fn spawn_reader<R: Read + Send + 'static>(reader: Option<R>) -> Receiver<Result<Vec<u8>>> {
