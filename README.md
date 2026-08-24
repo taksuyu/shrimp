@@ -150,13 +150,16 @@ and process side effects are shared.
 ```shrimp
 $ cargo metadata > "target/metadata.json"
 $ diagnostics 2> "target/diagnostics.log"
-secret token = "${DEPLOY_TOKEN}"
-$ deploy --token "${token}"
+secret env DEPLOY_TOKEN
+env DEPLOY_TOKEN="${DEPLOY_TOKEN}" $ deploy
 ```
 
 `>`, `>>`, and `2>` redirect final process output. `--trace` prints expanded actions;
 values declared with `secret` are replaced by `[REDACTED]` in traces. With `--trace`,
 Shrimp logs each declared argument/environment input by name and safely expanded commands.
+Secret workflow values cannot be interpolated into a program or command argument because
+argv is observable outside Shrimp. Pass them through an explicit per-command environment
+override as above, or through explicit stdin. Ordinary non-secret arguments are unchanged.
 `--dry-run`
 prints the plan without launching commands or changing files.
 

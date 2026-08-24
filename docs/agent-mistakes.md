@@ -6,9 +6,9 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
 
 | ID | Category | Count | Last seen | Prevention rule |
 | --- | --- | ---: | --- | --- |
-| PARSE-001 | Lossy syntax handling discarded quote/token boundaries | 6 | PR #3 follow-up, 2026-08-19 | Preserve raw token spans or quote metadata through classification and evaluation. Keep quote and escape semantics identical across the delimiter scanner and value tokenizer. Test quoted typed literals, backslashes in both quote styles, ignored suffixes, whitespace inside operands, and operator text inside arguments. |
+| PARSE-001 | Lossy syntax handling discarded quote/token boundaries | 9 | PR #5, 2026-08-24 | Preserve raw token spans or quote metadata through classification and evaluation. Route all language delimiters through the shared scanner. Keep quote and escape semantics identical across scanning and tokenization, and test quoted, escaped, nested, adjacent, and malformed forms. |
 | STATE-001 | Deferred/parallel execution lost required shared or lexical context | 3 | PR #3, 2026-08-18 | Classify cloned runtime state as local vs shared. Model waits between parallel workers and test nested parallel/deferred execution for deadlocks as well as incorrect results. |
-| SAFE-001 | Data crossed a trust or privacy boundary without validation | 4 | PR #5, 2026-08-24 | Treat workflow-derived paths and confidential inputs as untrusted. Avoid argv for secrets, use OS randomness plus exclusive creation for temporary resources, validate destinations before effects, give managed resources private permissions, and test collisions, cleanup, and exposure boundaries. |
+| SAFE-001 | Data crossed a trust or privacy boundary without validation | 6 | PR #5, 2026-08-24 | Treat workflow-derived paths and confidential inputs as untrusted. Prevent secrets from entering argv, recursively redact structured values, use OS randomness plus exclusive creation for temporary resources, validate destinations before effects, and test collisions, cleanup, and exposure boundaries. |
 | PORT-001 | A cross-platform test assumed a Unix utility | 1 | PR #3 | Use a portable test helper or gate utility-dependent tests with the appropriate target configuration. |
 | PARSE-002 | Malformed near-miss syntax was accepted as a different construct | 1 | PR #3 | For every new delimiter, test missing, doubled, truncated, quoted, and adjacent forms; reject unsupported forms at parse time. |
 | DESIGN-001 | Equivalent effect behavior was implemented in multiple places | 2 | PR #3, 2026-08-18 | Centralize effect helpers so behavior, diagnostics, and error propagation cannot drift between execution paths. Never detach a worker without collecting its result. |
@@ -18,7 +18,7 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
 
 ## Occurrence evidence
 
-### PARSE-001 — 6
+### PARSE-001 — 9
 
 1. Quoted comparison operands were stripped and then retyped, making `"4" == 4` true.
 2. Raw expression classification treated operators inside quoted command arguments as
@@ -30,6 +30,10 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
    apostrophe in a comment incorrectly became an unclosed quote.
 6. The delimiter scanner treated backslashes as escapes inside single quotes even though
    the value tokenizer treats single-quoted backslashes literally.
+7. Per-command environment bindings used raw `split_once('=')` rather than the shared
+   quote-aware scanner.
+8. Function calls used raw whitespace splitting for the function-name boundary.
+9. Structured lookup used raw split/find passes for record and list delimiters.
 
 ### STATE-001 — 3
 
@@ -46,7 +50,7 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
 2. Pipeline stdin writer code was duplicated across normal and timeout execution, and
    both detached copies silently discarded write failures.
 
-### SAFE-001 — 4
+### SAFE-001 — 6
 
 1. The typed-manifest example used an untrusted manifest name as an output path component.
 2. Managed Unix temporary files/directories used ambient permissions instead of
@@ -55,6 +59,9 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
    history and local process inspection before trace redaction could apply.
 4. Managed temporary paths used a predictable process-ID/counter name, allowing another
    local process to pre-create or anticipate workflow resources.
+5. Secret workflow values could still be interpolated into child argv after input-time
+   redaction protections were added.
+6. Redaction ignored list and record leaves because it only handled scalar secret values.
 
 ### Single-occurrence categories
 

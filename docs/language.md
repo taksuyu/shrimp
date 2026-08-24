@@ -36,13 +36,18 @@ replacement for an operating-system or deployment-platform secret store.
 
 ```shrimp
 let name = "ordinary value"
-secret token = "${TOKEN_FROM_ENV}"
+secret env DEPLOY_TOKEN
+env DEPLOY_TOKEN="${DEPLOY_TOKEN}" $ deploy
 capture revision <- git rev-parse --short HEAD
 ```
 
 Values use the small typed model described below. `capture` produces a UTF-8 string and removes trailing CR/LF characters.
 Undefined variables are errors. Secrets behave like ordinary values except that their
 contents are replaced with `[REDACTED]` in trace output.
+Secret values, including values created with `secret NAME = VALUE`, are rejected when
+interpolated into a command program or argument. Use an explicit per-command environment
+override or explicit stdin instead. Environment bindings may expand secrets because the
+value is passed through the child environment rather than argv.
 
 Tab-separated input can be named as a record. Field count and field names are
 validated, and fields are accessed with dotted interpolation:

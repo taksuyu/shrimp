@@ -1137,16 +1137,18 @@ impl Runtime {
             let (bindings, command) = split_operator(rest, " $ ").map_err(|_| {
                 Error::message("environment override syntax: env NAME=VALUE $ command")
             })?;
-            let bindings = words(bindings, &self.variables)?
+            let bindings = argument_sources(bindings)?
                 .into_iter()
                 .map(|binding| {
-                    let (name, value) = binding.split_once('=').ok_or_else(|| {
+                    let separator = scan_first_delimiter(binding, &["="])?.ok_or_else(|| {
                         Error::message(format!(
                             "environment override `{binding}` must be NAME=VALUE"
                         ))
                     })?;
+                    let name = &binding[..separator.index];
+                    let value = &binding[separator.index + separator.delimiter.len()..];
                     valid_env_name(name)?;
-                    Ok((name.to_owned(), value.to_owned()))
+                    Ok((name.to_owned(), self.expand_single(value)?))
                 })
                 .collect::<Result<Vec<_>>>()?;
             (bindings, command)
@@ -1157,11 +1159,28 @@ impl Runtime {
         let (command, input) = extract_input(source)?;
         let pieces = split_pipeline(command)?;
         let mut commands = pieces.into_iter().map(|piece| {
-            let mut values = words(piece, &self.variables)?.into_iter();
+            let mut values = words_with_secret_metadata(piece, &self.variables, &self.secrets)?
+                .into_iter();
             let program = values
                 .next()
                 .ok_or_else(|| Error::message("empty command in pipeline"))?;
-            let mut command = cmd(program).args(values);
+            if program.secret {
+                return Err(Error::message(
+                    "secret values cannot be used as command arguments; pass them with `env NAME=VALUE $ command` or stdin",
+                ));
+            }
+            let values = values
+                .map(|value| {
+                    if value.secret {
+                        Err(Error::message(
+                            "secret values cannot be used as command arguments; pass them with `env NAME=VALUE $ command` or stdin",
+                        ))
+                    } else {
+                        Ok(value.value)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut command = cmd(program.value).args(values);
             for (name, value) in &environment {
                 command = command.env(name, value);
             }
@@ -1207,10 +1226,8 @@ impl Runtime {
     }
     fn redact(&self, mut value: String) -> String {
         for name in &self.secrets {
-            if let Some(secret) = self.variables.get(name).and_then(|v| v.scalar().ok())
-                && !secret.is_empty()
-            {
-                value = value.replace(&secret, "[REDACTED]");
+            if let Some(secret) = self.variables.get(name) {
+                redact_value_leaves(secret, &mut value);
             }
         }
         value
@@ -1677,8 +1694,7 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
             }
         }
     } else if let Some(rest) = text.strip_prefix("retry ") {
-        let (count, command) = rest
-            .split_once(' ')
+        let (count, command) = split_first_whitespace(rest)?
             .ok_or_else(|| script_error(line, "retry syntax: retry COUNT $ command"))?;
         StatementKind::Retry {
             attempts: count
@@ -1687,8 +1703,7 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
             command: command.strip_prefix("$ ").unwrap_or(command).into(),
         }
     } else if let Some(rest) = text.strip_prefix("timeout ") {
-        let (duration, command) = rest
-            .split_once(' ')
+        let (duration, command) = split_first_whitespace(rest)?
             .ok_or_else(|| script_error(line, "timeout syntax: timeout DURATION $ command"))?;
         StatementKind::Timeout {
             duration: parse_duration(duration)?,
@@ -1794,7 +1809,7 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
             } else {
                 (None, rest)
             };
-        let (name, args) = invocation.split_once(' ').unwrap_or((invocation, ""));
+        let (name, args) = split_first_whitespace(invocation)?.unwrap_or((invocation, ""));
         valid_name(name)?;
         StatementKind::Call {
             target,
@@ -1856,6 +1871,17 @@ fn split_operator_last<'a>(value: &'a str, delimiter: &str) -> Result<Option<(&'
             value[found.index + found.delimiter.len()..].trim(),
         )
     }))
+}
+
+fn split_first_whitespace(value: &str) -> Result<Option<(&str, &str)>> {
+    Ok(
+        scan_first_delimiter(value, &[" ", "\t", "\r", "\n"])?.map(|separator| {
+            (
+                &value[..separator.index],
+                value[separator.index + separator.delimiter.len()..].trim_start(),
+            )
+        }),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2003,15 +2029,17 @@ fn split_pipeline(line: &str) -> Result<Vec<&str>> {
     Ok(result)
 }
 fn lookup<'a>(variables: &'a HashMap<String, Value>, path: &str) -> Result<&'a Value> {
-    let (base, mut rest) = path
-        .split_once(['.', '['])
-        .map_or((path, ""), |(a, _)| (a, &path[a.len()..]));
+    let first = scan_first_delimiter(path, &[".", "[", "]"])?;
+    let (base, mut rest) = first.map_or((path, ""), |found| {
+        (&path[..found.index], &path[found.index..])
+    });
     let mut value = variables
         .get(base)
         .ok_or_else(|| Error::message(format!("undefined variable `{base}`")))?;
     while !rest.is_empty() {
         if let Some(field) = rest.strip_prefix('.') {
-            let end = field.find(['.', '[']).unwrap_or(field.len());
+            let end = scan_first_delimiter(field, &[".", "[", "]"])?
+                .map_or(field.len(), |found| found.index);
             let key = &field[..end];
             value = match value {
                 Value::Record(values) => values.get(key),
@@ -2020,8 +2048,9 @@ fn lookup<'a>(variables: &'a HashMap<String, Value>, path: &str) -> Result<&'a V
             .ok_or_else(|| Error::message(format!("missing record field `{key}`")))?;
             rest = &field[end..];
         } else if let Some(index) = rest.strip_prefix('[') {
-            let end = index
-                .find(']')
+            let end = scan_first_delimiter(index, &[".", "[", "]"])?
+                .filter(|found| found.delimiter == "]")
+                .map(|found| found.index)
                 .ok_or_else(|| Error::message("unclosed list index"))?;
             let number: usize = index[..end]
                 .parse()
@@ -2078,9 +2107,28 @@ fn argument_sources(source: &str) -> Result<Vec<&str>> {
     Ok(result)
 }
 
+struct ExpandedWord {
+    value: String,
+    secret: bool,
+}
+
 fn words(source: &str, variables: &HashMap<String, Value>) -> Result<Vec<String>> {
+    Ok(
+        words_with_secret_metadata(source, variables, &HashSet::new())?
+            .into_iter()
+            .map(|word| word.value)
+            .collect(),
+    )
+}
+
+fn words_with_secret_metadata(
+    source: &str,
+    variables: &HashMap<String, Value>,
+    secrets: &HashSet<String>,
+) -> Result<Vec<ExpandedWord>> {
     let mut result = Vec::new();
     let mut word = String::new();
+    let mut word_is_secret = false;
     let mut quote = None;
     let mut started = false;
     let mut chars = source.chars().peekable();
@@ -2108,8 +2156,12 @@ fn words(source: &str, variables: &HashMap<String, Value>) -> Result<Vec<String>
             }
             c if c.is_whitespace() && quote.is_none() => {
                 if started {
-                    result.push(std::mem::take(&mut word));
-                    started = false
+                    result.push(ExpandedWord {
+                        value: std::mem::take(&mut word),
+                        secret: word_is_secret,
+                    });
+                    started = false;
+                    word_is_secret = false;
                 }
             }
             '$' if quote != Some('\'') && chars.peek() == Some(&'{') => {
@@ -2128,6 +2180,9 @@ fn words(source: &str, variables: &HashMap<String, Value>) -> Result<Vec<String>
                 if !closed {
                     return Err(Error::message("unclosed variable interpolation"));
                 }
+                let root = scan_first_delimiter(&name, &[".", "[", "]"])?
+                    .map_or(name.as_str(), |found| &name[..found.index]);
+                word_is_secret |= secrets.contains(root);
                 word.push_str(&lookup(variables, &name)?.scalar()?)
             }
             other => {
@@ -2140,7 +2195,29 @@ fn words(source: &str, variables: &HashMap<String, Value>) -> Result<Vec<String>
         return Err(Error::message("unclosed quote"));
     }
     if started {
-        result.push(word)
+        result.push(ExpandedWord {
+            value: word,
+            secret: word_is_secret,
+        })
     }
     Ok(result)
+}
+
+fn redact_value_leaves(secret: &Value, output: &mut String) {
+    match secret {
+        Value::String(value) if !value.is_empty() => *output = output.replace(value, "[REDACTED]"),
+        Value::Boolean(value) => *output = output.replace(&value.to_string(), "[REDACTED]"),
+        Value::Integer(value) => *output = output.replace(&value.to_string(), "[REDACTED]"),
+        Value::List(values) => {
+            for value in values {
+                redact_value_leaves(value, output);
+            }
+        }
+        Value::Record(values) => {
+            for value in values.values() {
+                redact_value_leaves(value, output);
+            }
+        }
+        Value::Missing | Value::String(_) => {}
+    }
 }

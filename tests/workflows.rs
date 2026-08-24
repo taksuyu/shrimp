@@ -222,7 +222,7 @@ fn trace_redacts_secret_values() {
     let script = root.join("secret.shrimp");
     std::fs::write(
         &script,
-        "secret token = top-secret-value\n$ printf %s ${token}\n",
+        "secret token = top-secret-value\n$ cat <<< ${token}\n",
     )
     .unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_shrimp"))
@@ -1073,7 +1073,7 @@ fn trace_logs_declared_inputs_and_redacts_secret_environment_values() {
     let script = root.join("inputs.shrimp");
     std::fs::write(
         &script,
-        "arg PROFILE\nsecret env SHRIMP_TRACE_TOKEN\n$ printf %s ${PROFILE}:${SHRIMP_TRACE_TOKEN}\n",
+        "arg PROFILE\nsecret env SHRIMP_TRACE_TOKEN\nenv SHRIMP_TRACE_TOKEN=\"${SHRIMP_TRACE_TOKEN}\" $ sh -c 'printf %s \"$SHRIMP_TRACE_TOKEN\"'\n$ printf %s ${PROFILE}\n",
     )
     .unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_shrimp"))
@@ -1087,5 +1087,68 @@ fn trace_logs_declared_inputs_and_redacts_secret_environment_values() {
     assert!(trace.contains("use env SHRIMP_TRACE_TOKEN"), "{trace}");
     assert!(trace.contains("[REDACTED]"), "{trace}");
     assert!(!trace.contains("private-token"), "{trace}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_values_are_rejected_in_argv_but_allowed_in_env_and_stdin() {
+    let root = sandbox("secret-command-channels");
+    let context = Context::new(&root).with_env("SHRIMP_SECRET_INPUT", "private-value");
+
+    for source in [
+        "secret env SHRIMP_SECRET_INPUT\n$ printf %s ${SHRIMP_SECRET_INPUT}\n",
+        "secret token = private-value\n$ printf %s ${token}\n",
+    ] {
+        let error = shrimp::Script::parse(source)
+            .unwrap()
+            .run(&context)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be used as command arguments")
+        );
+    }
+
+    let allowed = shrimp::Script::parse(
+        "secret env SHRIMP_SECRET_INPUT\nenv TOKEN=\"${SHRIMP_SECRET_INPUT}\" $ sh -c 'printf %s \"$TOKEN\"' > \"env-result\"\n$ cat <<< \"${SHRIMP_SECRET_INPUT}\" > \"stdin-result\"\n$ printf %s ordinary > \"ordinary-result\"\n",
+    )
+    .unwrap();
+    allowed.run(&context).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("env-result")).unwrap(),
+        "private-value"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("stdin-result")).unwrap(),
+        "private-value"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("ordinary-result")).unwrap(),
+        "ordinary"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_redacts_secret_list_and_record_leaves() {
+    let root = sandbox("structured-secret-trace");
+    let script = root.join("structured-secrets.shrimp");
+    std::fs::write(
+        &script,
+        "secret items = words \"list-secret other-secret\"\nrecord source tsv \"record-secret\" fields token\nsecret row = ${source}\nprint \"${items[0]}:${row.token}\"\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_shrimp"))
+        .args(["--trace", script.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let trace = String::from_utf8(output.stderr).unwrap();
+    assert!(!trace.contains("list-secret"), "{trace}");
+    assert!(!trace.contains("record-secret"), "{trace}");
+    assert!(trace.matches("[REDACTED]").count() >= 2, "{trace}");
     std::fs::remove_dir_all(root).unwrap();
 }
