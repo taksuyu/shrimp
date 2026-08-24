@@ -272,7 +272,8 @@ modified_time changed_at <- "output.txt"
 
 Functions implicitly return their final statement value and accept typed arguments;
 there is no early-return control flow. Temporary paths are cleaned up when the workflow
-ends. Metadata values are integers. See the language reference for exact semantics and
+ends; names use OS randomness and exclusive creation retries collisions. Metadata values
+are integers. See the language reference for exact semantics and
 for a difficulty-ranked list of potential future work.
 
 ## Reusable workflow files

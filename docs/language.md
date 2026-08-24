@@ -134,7 +134,9 @@ modified_time changed_at <- "artifact.tar.gz"
 Temporary statements bind an absolute string path and create it immediately. All
 temporary paths are removed at workflow completion, including error completion;
 parallel branches share the cleanup registry. Dry-run assigns a planned path but does
-not create it. On Unix, managed files use mode `0600` and directories use `0700`.
+not create it. Names use operating-system randomness and creation is exclusive, retrying
+the unlikely event of a collision. On Unix, managed files use mode `0600` and directories
+use `0700`.
 `file_size` returns bytes as an integer. `modified_time` returns whole seconds since
 the Unix epoch as an integer and rejects pre-epoch or overflowing values.
 

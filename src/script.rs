@@ -6,10 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::Duration,
 };
@@ -43,7 +40,6 @@ impl Value {
 }
 
 const MAX_FUNCTION_CALL_DEPTH: usize = 64;
-static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct Script {
@@ -855,21 +851,28 @@ impl Runtime {
     }
 
     fn create_temporary(&mut self, name: &str, directory: bool) -> Result<()> {
-        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("shrimp-{}-{id}", std::process::id()));
+        let path = if self.options.dry_run {
+            temporary_candidate()
+                .map_err(|error| Error::io("choose temporary resource name", None, error))?
+        } else {
+            create_temporary_resource(directory, temporary_candidate).map_err(|(path, error)| {
+                Error::io(
+                    if directory {
+                        "create temporary directory"
+                    } else {
+                        "create temporary file"
+                    },
+                    path,
+                    error,
+                )
+            })?
+        };
         self.trace(&format!(
             "{} {}",
             if directory { "temp_dir" } else { "temp_file" },
             path.display()
         ));
         if !self.options.dry_run {
-            if directory {
-                create_private_dir(&path)
-                    .map_err(|e| Error::io("create temporary directory", Some(path.clone()), e))?;
-            } else {
-                create_private_file(&path)
-                    .map_err(|e| Error::io("create temporary file", Some(path.clone()), e))?;
-            }
             self.temporary_paths
                 .lock()
                 .expect("temporary path registry poisoned")
@@ -1299,6 +1302,37 @@ fn resolve(base: &Path, path: &str) -> PathBuf {
     }
 }
 
+fn temporary_candidate() -> std::io::Result<PathBuf> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|error| std::io::Error::other(format!("obtain OS randomness: {error}")))?;
+    let mut name = String::from("shrimp-");
+    for byte in random {
+        use std::fmt::Write as _;
+        write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(std::env::temp_dir().join(name))
+}
+
+fn create_temporary_resource(
+    directory: bool,
+    mut candidate: impl FnMut() -> std::io::Result<PathBuf>,
+) -> std::result::Result<PathBuf, (Option<PathBuf>, std::io::Error)> {
+    loop {
+        let path = candidate().map_err(|error| (None, error))?;
+        let result = if directory {
+            create_private_dir(&path)
+        } else {
+            create_private_file(&path).map(drop)
+        };
+        match result {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err((Some(path), error)),
+        }
+    }
+}
+
 #[cfg(unix)]
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
@@ -1324,6 +1358,29 @@ fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(not(unix))]
 fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::create_new(path)
+}
+
+#[cfg(test)]
+mod temporary_tests {
+    use super::create_temporary_resource;
+
+    #[test]
+    fn temporary_creation_retries_after_an_existing_candidate() {
+        let root =
+            std::env::temp_dir().join(format!("shrimp-temp-retry-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let collision = root.join("collision");
+        let available = root.join("available");
+        std::fs::write(&collision, "occupied").unwrap();
+        let mut candidates = [collision, available.clone()].into_iter();
+
+        let path = create_temporary_resource(false, || Ok(candidates.next().unwrap())).unwrap();
+
+        assert_eq!(path, available);
+        assert!(path.is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 fn script_error(line: usize, message: impl Into<String>) -> Error {
     Error::Script {
