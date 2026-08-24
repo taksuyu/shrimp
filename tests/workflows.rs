@@ -1017,6 +1017,18 @@ fn workflow_arguments_must_be_declared_explicitly() {
 }
 
 #[test]
+fn secret_workflow_arguments_are_rejected_before_execution() {
+    let error = shrimp::Script::parse("secret arg API_TOKEN\n").unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("script line 1"), "{message}");
+    assert!(
+        message.contains("command-line arguments are visible"),
+        "{message}"
+    );
+    assert!(message.contains("secret env NAME"), "{message}");
+}
+
+#[test]
 fn with_cwd_is_scoped_while_cd_is_persistent() {
     let root = sandbox("scoped-cwd");
     std::fs::create_dir_all(root.join("one/two")).unwrap();

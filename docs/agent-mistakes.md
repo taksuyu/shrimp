@@ -8,7 +8,7 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
 | --- | --- | ---: | --- | --- |
 | PARSE-001 | Lossy syntax handling discarded quote/token boundaries | 6 | PR #3 follow-up, 2026-08-19 | Preserve raw token spans or quote metadata through classification and evaluation. Keep quote and escape semantics identical across the delimiter scanner and value tokenizer. Test quoted typed literals, backslashes in both quote styles, ignored suffixes, whitespace inside operands, and operator text inside arguments. |
 | STATE-001 | Deferred/parallel execution lost required shared or lexical context | 3 | PR #3, 2026-08-18 | Classify cloned runtime state as local vs shared. Model waits between parallel workers and test nested parallel/deferred execution for deadlocks as well as incorrect results. |
-| SAFE-001 | Filesystem data crossed a trust or privacy boundary without validation | 2 | PR #3 | Treat workflow-derived path components as untrusted and avoid using them as destinations without containment. Give managed temporary resources private permissions and test cleanup and modes. |
+| SAFE-001 | Data crossed a trust or privacy boundary without validation | 3 | PR #5, 2026-08-24 | Treat workflow-derived paths and confidential inputs as untrusted. Avoid argv for secrets, validate destinations before effects, give managed temporary resources private permissions, and test cleanup and exposure boundaries. |
 | PORT-001 | A cross-platform test assumed a Unix utility | 1 | PR #3 | Use a portable test helper or gate utility-dependent tests with the appropriate target configuration. |
 | PARSE-002 | Malformed near-miss syntax was accepted as a different construct | 1 | PR #3 | For every new delimiter, test missing, doubled, truncated, quoted, and adjacent forms; reject unsupported forms at parse time. |
 | DESIGN-001 | Equivalent effect behavior was implemented in multiple places | 2 | PR #3, 2026-08-18 | Centralize effect helpers so behavior, diagnostics, and error propagation cannot drift between execution paths. Never detach a worker without collecting its result. |
@@ -46,11 +46,13 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
 2. Pipeline stdin writer code was duplicated across normal and timeout execution, and
    both detached copies silently discarded write failures.
 
-### SAFE-001 — 2
+### SAFE-001 — 3
 
 1. The typed-manifest example used an untrusted manifest name as an output path component.
 2. Managed Unix temporary files/directories used ambient permissions instead of
    explicitly private modes.
+3. `secret arg` accepted confidential values through argv, exposing them to shell
+   history and local process inspection before trace redaction could apply.
 
 ### Single-occurrence categories
 

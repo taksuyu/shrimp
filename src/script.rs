@@ -1582,13 +1582,10 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
             environment: false,
             secret: false,
         }
-    } else if let Some(name) = text.strip_prefix("secret arg ") {
-        valid_name(name)?;
-        StatementKind::Input {
-            name: name.into(),
-            environment: false,
-            secret: true,
-        }
+    } else if text.starts_with("secret arg ") {
+        return Err(Error::message(
+            "secret workflow arguments are not supported because command-line arguments are visible to shell history and process inspection; use `secret env NAME`",
+        ));
     } else if let Some(name) = text.strip_prefix("secret env ") {
         valid_name(name)?;
         StatementKind::Input {

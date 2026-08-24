@@ -72,6 +72,12 @@ traces and diagnostics. Values that were supplied but never declared are unavail
 interpolation. Child processes still inherit the runner environment in the ordinary OS
 way; declarations control workflow values, not process inheritance.
 
+Shrimp deliberately rejects `secret arg NAME`: command-line values can be exposed by
+shell history and local process inspection before Shrimp can redact them. Pass
+confidential inputs through `secret env NAME` instead. Environment variables are not a
+universal secret store, but they avoid placing the value directly in Shrimp's argv;
+production workflows should use their platform's credential injection facilities.
+
 ```console
 shrimp deploy.shrimp ENV=staging VERSION=1.2.3
 ```

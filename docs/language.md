@@ -21,7 +21,6 @@ Workflow entry points declare external inputs explicitly:
 ```shrimp
 arg PROFILE
 env HOME
-secret arg API_TOKEN
 secret env DEPLOY_TOKEN
 ```
 
@@ -30,6 +29,10 @@ required `env` declarations read the runner's ambient environment. Missing input
 line-aware errors. Supplying an argument does not implicitly create a workflow variable,
 and importing an environment value does not mutate the environment. Secret forms redact
 the imported value. Trace mode records input use by name without logging secret values.
+`secret arg NAME` is rejected because argv is observable through shell history and local
+process inspection before runtime redaction applies. Confidential inputs must use
+`secret env NAME`; environment injection avoids argv exposure but is not presented as a
+replacement for an operating-system or deployment-platform secret store.
 
 ```shrimp
 let name = "ordinary value"
