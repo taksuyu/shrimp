@@ -42,8 +42,8 @@ capture revision <- git rev-parse --short HEAD
 ```
 
 Values use the small typed model described below. `capture` produces a UTF-8 string and removes trailing CR/LF characters.
-Undefined variables are errors. Secrets behave like ordinary values except that their
-contents are replaced with `[REDACTED]` in trace output.
+Undefined variables are errors. Secrets behave like ordinary values except that trace
+redaction follows the value type, length, and digit-boundary rules below.
 Boolean and one-to-three-digit integer secret leaves are deliberately not used as global
 substring-redaction keys because values such as `true`, `1`, or `12` would corrupt
 unrelated diagnostics. Integers with at least four digits are redacted only at digit

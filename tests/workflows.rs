@@ -615,6 +615,22 @@ fn includes_reusable_functions_relative_to_each_including_file_once() {
 }
 
 #[test]
+fn include_exports_assignments_even_when_first_caller_had_the_same_value() {
+    let root = sandbox("include-same-value-export");
+    std::fs::write(root.join("bindings.shrimp"), "let shared = same\n").unwrap();
+    let script = shrimp::Script::parse(
+        "fn prime\n  let shared = same\n  include \"bindings.shrimp\"\nend\ncall prime\ninclude \"bindings.shrimp\"\nwrite \"result\" <- \"${shared}\"\n",
+    )
+    .unwrap();
+    script.run(&Context::new(&root)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "same"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn include_cycles_report_the_file_and_call_site() {
     let root = sandbox("include-cycle");
     std::fs::write(root.join("a.shrimp"), "include \"b.shrimp\"\n").unwrap();
@@ -1169,6 +1185,29 @@ fn secret_values_are_rejected_in_argv_but_allowed_in_env_and_stdin() {
         "ordinary"
     );
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_provenance_survives_alias_parameters_and_function_results() {
+    let context = Context::default();
+    let cases = [
+        "secret source = distinctive-secret\nlet alias = ${source}\n$ printf %s ${alias}\n",
+        "fn consume input\n  $ printf %s ${input}\nend\nsecret source = distinctive-secret\ncall consume ${source}\n",
+        "fn identity input\n  value ${input}\nend\nsecret source = distinctive-secret\ncall result <- identity ${source}\n$ printf %s ${result}\n",
+    ];
+    for source in cases {
+        let error = shrimp::Script::parse(source)
+            .unwrap()
+            .run(&context)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be used as command arguments"),
+            "{error}"
+        );
+    }
 }
 
 #[cfg(unix)]

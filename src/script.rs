@@ -267,6 +267,8 @@ impl Script {
             includes: Arc::new((Mutex::new(IncludeRegistry::default()), Condvar::new())),
             include_chain: Vec::new(),
             last_value: Value::Missing,
+            last_value_secret: false,
+            assigned_variables: Vec::new(),
             temporary_paths: Arc::new(Mutex::new(Vec::new())),
         };
         let result = runtime
@@ -293,10 +295,60 @@ struct Runtime {
     // re-entry is detected even when the owning thread is blocked in `join`.
     include_chain: Vec<PathBuf>,
     last_value: Value,
+    last_value_secret: bool,
+    assigned_variables: Vec<String>,
     temporary_paths: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl Runtime {
+    fn bind(&mut self, name: String, value: Value, secret: bool) {
+        self.assigned_variables.push(name.clone());
+        self.variables.insert(name.clone(), value);
+        if secret {
+            self.secrets.insert(name);
+        } else {
+            self.secrets.remove(&name);
+        }
+    }
+
+    fn source_references_secret(&self, source: &str) -> Result<bool> {
+        let source = source.trim();
+        if !source.starts_with(['\'', '"']) && self.secrets.contains(secret_root(source)?) {
+            return Ok(true);
+        }
+        let mut quote = None;
+        let mut escaped = false;
+        let chars: Vec<_> = source.char_indices().collect();
+        let mut position = 0;
+        while position < chars.len() {
+            let (index, character) = chars[position];
+            if escaped {
+                escaped = false;
+                position += 1;
+                continue;
+            }
+            if character == '\\' && quote != Some('\'') {
+                escaped = true;
+            } else if character == '\'' || character == '"' {
+                if quote == Some(character) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(character);
+                }
+            } else if character == '$' && quote != Some('\'') && source[index..].starts_with("${") {
+                let rest = &source[index + 2..];
+                let end = scan_first_delimiter(rest, &["}"])?
+                    .map(|delimiter| delimiter.index)
+                    .ok_or_else(|| Error::message("unclosed variable interpolation"))?;
+                if self.secrets.contains(secret_root(&rest[..end])?) {
+                    return Ok(true);
+                }
+            }
+            position += 1;
+        }
+        Ok(false)
+    }
+
     fn execute(&mut self, statements: &[Statement]) -> Result<()> {
         for statement in statements {
             self.execute_one(statement)
@@ -307,6 +359,7 @@ impl Runtime {
 
     fn execute_one(&mut self, statement: &Statement) -> Result<()> {
         self.last_value = Value::Missing;
+        self.last_value_secret = false;
         match &statement.kind {
             StatementKind::Input {
                 name,
@@ -330,11 +383,9 @@ impl Runtime {
                         ))
                     })?
                 };
-                if *secret {
-                    self.secrets.insert(name.clone());
-                }
-                self.variables.insert(name.clone(), Value::String(value));
+                self.bind(name.clone(), Value::String(value), *secret);
                 self.last_value = self.variables[name].clone();
+                self.last_value_secret = *secret;
                 self.trace(&format!(
                     "use {} {name}",
                     if *environment { "env" } else { "arg" }
@@ -345,18 +396,16 @@ impl Runtime {
                 value,
                 secret,
             } => {
+                let inherited_secret = self.source_references_secret(value)?;
                 let value = self.eval_value(value)?;
-                self.variables.insert(name.clone(), value);
+                self.bind(name.clone(), value, *secret || inherited_secret);
                 self.last_value = self.variables[name].clone();
-                if *secret {
-                    self.secrets.insert(name.clone());
-                }
+                self.last_value_secret = *secret || inherited_secret;
             }
             StatementKind::Capture { name, command } => {
                 self.trace_command("capture", command)?;
                 if self.options.dry_run {
-                    self.variables
-                        .insert(name.clone(), Value::String(String::new()));
+                    self.bind(name.clone(), Value::String(String::new()), false);
                 } else {
                     let invocation = self.invocation(command)?;
                     if invocation.redirect.is_some() {
@@ -366,7 +415,7 @@ impl Runtime {
                     }
                     let output = invocation.run(&self.context)?;
                     self.report.commands_run += 1;
-                    self.variables.insert(
+                    self.bind(
                         name.clone(),
                         Value::String(
                             output
@@ -374,6 +423,7 @@ impl Runtime {
                                 .trim_end_matches(['\r', '\n'])
                                 .to_owned(),
                         ),
+                        false,
                     );
                 }
                 self.last_value = self.variables[name].clone();
@@ -530,6 +580,7 @@ impl Runtime {
                 value,
                 fields,
             } => {
+                let secret = self.source_references_secret(value)?;
                 let value = self.expand_single(value)?;
                 let parts: Vec<_> = value.split('\t').collect();
                 if parts.len() != fields.len() {
@@ -545,8 +596,9 @@ impl Runtime {
                     .map(|(field, value)| (field.clone(), Value::String(value.into())))
                     .collect();
                 let value = Value::Record(record);
-                self.variables.insert(name.clone(), value.clone());
+                self.bind(name.clone(), value.clone(), secret);
                 self.last_value = value;
+                self.last_value_secret = secret;
             }
             StatementKind::Print(value) => {
                 let value = self.expand_single(value)?;
@@ -626,14 +678,18 @@ impl Runtime {
                 name,
                 arguments,
             } => {
-                let value = self.call(name, arguments)?;
+                let (value, secret) = self.call(name, arguments)?;
                 if let Some(target) = target {
-                    self.variables.insert(target.clone(), value.clone());
+                    self.bind(target.clone(), value.clone(), secret);
                 }
                 self.last_value = value;
+                self.last_value_secret = secret;
             }
             StatementKind::Include(path) => self.include(path)?,
-            StatementKind::Value(source) => self.last_value = self.eval_value(source)?,
+            StatementKind::Value(source) => {
+                self.last_value = self.eval_value(source)?;
+                self.last_value_secret = self.source_references_secret(source)?;
+            }
             StatementKind::Temp { name, directory } => self.create_temporary(name, *directory)?,
             StatementKind::Metadata {
                 name,
@@ -823,7 +879,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn call(&mut self, name: &str, arguments: &str) -> Result<Value> {
+    fn call(&mut self, name: &str, arguments: &str) -> Result<(Value, bool)> {
         if self.call_depth >= MAX_FUNCTION_CALL_DEPTH {
             return Err(Error::message(format!(
                 "function call depth exceeded the limit of {MAX_FUNCTION_CALL_DEPTH}"
@@ -836,7 +892,12 @@ impl Runtime {
             .ok_or_else(|| Error::message(format!("undefined function `{name}`")))?;
         let arguments = argument_sources(arguments)?
             .into_iter()
-            .map(|argument| self.eval_value(argument))
+            .map(|argument| {
+                Ok((
+                    self.eval_value(argument)?,
+                    self.source_references_secret(argument)?,
+                ))
+            })
             .collect::<Result<Vec<_>>>()?;
         if arguments.len() != definition.parameters.len() {
             return Err(Error::message(format!(
@@ -846,19 +907,25 @@ impl Runtime {
             )));
         }
         let saved = self.variables.clone();
-        for (parameter, argument) in definition.parameters.into_iter().zip(arguments) {
-            self.variables.insert(parameter, argument);
+        let saved_secrets = self.secrets.clone();
+        let saved_assignments = self.assigned_variables.len();
+        for (parameter, (argument, secret)) in definition.parameters.into_iter().zip(arguments) {
+            self.bind(parameter, argument, secret);
         }
         self.call_depth += 1;
         let saved_value = self.last_value.clone();
+        let saved_value_secret = self.last_value_secret;
         self.source_dirs.push(definition.source_dir);
         let result = self
             .execute(&definition.body)
-            .map(|()| self.last_value.clone());
+            .map(|()| (self.last_value.clone(), self.last_value_secret));
         self.source_dirs.pop();
         self.call_depth -= 1;
         self.variables = saved;
+        self.secrets = saved_secrets;
+        self.assigned_variables.truncate(saved_assignments);
         self.last_value = saved_value;
+        self.last_value_secret = saved_value_secret;
         result
     }
 
@@ -891,7 +958,7 @@ impl Runtime {
                 .push(path.clone());
         }
         let value = Value::String(path.to_string_lossy().into_owned());
-        self.variables.insert(name.into(), value.clone());
+        self.bind(name.into(), value.clone(), false);
         self.last_value = value;
         Ok(())
     }
@@ -923,7 +990,7 @@ impl Runtime {
         ));
         if self.options.dry_run {
             let value = Value::Integer(0);
-            self.variables.insert(name.into(), value.clone());
+            self.bind(name.into(), value.clone(), false);
             self.last_value = value;
             return Ok(());
         }
@@ -945,7 +1012,7 @@ impl Runtime {
                 .map_err(|_| Error::message("file size does not fit in an integer"))?
         };
         let value = Value::Integer(number);
-        self.variables.insert(name.into(), value.clone());
+        self.bind(name.into(), value.clone(), false);
         self.last_value = value;
         Ok(())
     }
@@ -972,7 +1039,10 @@ impl Runtime {
             let mut registry = lock.lock().expect("include registry poisoned");
             if let Some(exports) = registry.loaded.get(&path).cloned() {
                 drop(registry);
-                self.variables.extend(exports.variables);
+                for (name, value) in exports.variables {
+                    let secret = exports.secrets.contains(&name);
+                    self.bind(name, value, secret);
+                }
                 self.functions.extend(exports.functions);
                 self.secrets.extend(exports.secrets);
                 return Ok(());
@@ -999,7 +1069,7 @@ impl Runtime {
             registry.active.insert(path.clone(), current_thread);
             break;
         }
-        let variables_before = self.variables.clone();
+        let assignments_before = self.assigned_variables.len();
         let functions_before = self.functions.clone();
         let secrets_before = self.secrets.clone();
         self.include_chain.push(path.clone());
@@ -1021,11 +1091,17 @@ impl Runtime {
         let mut registry = lock.lock().expect("include registry poisoned");
         registry.active.remove(&path);
         if result.is_ok() {
-            let variables = self
-                .variables
+            let assigned: HashSet<_> = self.assigned_variables[assignments_before..]
                 .iter()
-                .filter(|(name, value)| variables_before.get(*name) != Some(*value))
-                .map(|(name, value)| (name.clone(), value.clone()))
+                .cloned()
+                .collect();
+            let variables = assigned
+                .iter()
+                .filter_map(|name| {
+                    self.variables
+                        .get(name)
+                        .map(|value| (name.clone(), value.clone()))
+                })
                 .collect();
             let functions = self
                 .functions
@@ -2068,6 +2144,11 @@ fn split_pipeline(line: &str) -> Result<Vec<&str>> {
     result.push(line[start..].trim());
     Ok(result)
 }
+fn secret_root(path: &str) -> Result<&str> {
+    Ok(scan_first_delimiter(path, &[".", "[", "]"])?
+        .map_or(path, |delimiter| &path[..delimiter.index]))
+}
+
 fn lookup<'a>(variables: &'a HashMap<String, Value>, path: &str) -> Result<&'a Value> {
     let first = scan_first_delimiter(path, &[".", "[", "]"])?;
     let (base, mut rest) = first.map_or((path, ""), |found| {
