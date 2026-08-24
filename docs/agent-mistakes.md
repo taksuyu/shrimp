@@ -7,14 +7,15 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
 | ID | Category | Count | Last seen | Prevention rule |
 | --- | --- | ---: | --- | --- |
 | PARSE-001 | Lossy syntax handling discarded quote/token boundaries | 9 | PR #5, 2026-08-24 | Preserve raw token spans or quote metadata through classification and evaluation. Route all language delimiters through the shared scanner. Keep quote and escape semantics identical across scanning and tokenization, and test quoted, escaped, nested, adjacent, and malformed forms. |
-| STATE-001 | Deferred/parallel execution lost required shared or lexical context | 3 | PR #3, 2026-08-18 | Classify cloned runtime state as local vs shared. Model waits between parallel workers and test nested parallel/deferred execution for deadlocks as well as incorrect results. |
-| SAFE-001 | Data crossed a trust or privacy boundary without validation | 6 | PR #5, 2026-08-24 | Treat workflow-derived paths and confidential inputs as untrusted. Prevent secrets from entering argv, recursively redact structured values, use OS randomness plus exclusive creation for temporary resources, validate destinations before effects, and test collisions, cleanup, and exposure boundaries. |
+| STATE-001 | Deferred/parallel execution lost required shared or lexical context | 4 | PR #5, 2026-08-24 | Classify cloned runtime state as local vs shared. Preserve logical ancestry across thread clones, model waits and joins, and test nested parallel/deferred execution for deadlocks as well as incorrect results. |
+| SAFE-001 | Data crossed a trust or privacy boundary without validation | 7 | PR #5, 2026-08-24 | Treat workflow-derived paths and confidential inputs as untrusted. Prevent secrets from entering argv, redact structured leaves only when sufficiently distinctive, use OS randomness plus exclusive creation for temporary resources, validate destinations before effects, and test collisions, cleanup, over-redaction, and exposure boundaries. |
 | PORT-001 | A cross-platform test assumed a Unix utility | 1 | PR #3 | Use a portable test helper or gate utility-dependent tests with the appropriate target configuration. |
 | PARSE-002 | Malformed near-miss syntax was accepted as a different construct | 1 | PR #3 | For every new delimiter, test missing, doubled, truncated, quoted, and adjacent forms; reject unsupported forms at parse time. |
 | DESIGN-001 | Equivalent effect behavior was implemented in multiple places | 2 | PR #3, 2026-08-18 | Centralize effect helpers so behavior, diagnostics, and error propagation cannot drift between execution paths. Never detach a worker without collecting its result. |
 | VALUE-001 | One typed-value consumer bypassed structured lookup | 1 | PR #3 | Route all variable, record-field, and list-index resolution through the same lookup function; test nested paths in every consumer. |
 | DOC-001 | User-facing wording obscured an execution semantic | 1 | PR #3, 2026-08-18 | Prefer concrete observable language. Review documentation statements against tests and replace tautological descriptions with explicit behavior. |
 | OPS-001 | Shell quoting altered text passed to a developer tool | 1 | PR #3 follow-up, 2026-08-18 | Pass Markdown bodies through a single-quoted heredoc or file; never place backticks or expansion syntax inside a double-quoted shell argument. |
+| DRY-001 | Dry-run performed an effect-dependent filesystem read | 1 | PR #5, 2026-08-24 | Trace before effects and audit each effect-dependent statement for a dry-run value that does not access state suppressed by the plan. |
 
 ## Occurrence evidence
 
@@ -35,7 +36,7 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
 8. Function calls used raw whitespace splitting for the function-name boundary.
 9. Structured lookup used raw split/find passes for record and list delimiters.
 
-### STATE-001 — 3
+### STATE-001 — 4
 
 1. A function defined in an included file did not retain that file's directory for an
    `include` executed later from the function body.
@@ -43,6 +44,8 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
    effects to execute more than once per workflow.
 3. A global include owner waited for parallel workers while those workers waited for the
    owner's registry, deadlocking nested includes.
+4. Include cycle detection tracked OS-thread waits but not inherited logical include
+   lineage, so a parallel child could deadlock re-entering its owner's include.
 
 ### DESIGN-001 — 2
 
@@ -50,7 +53,7 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
 2. Pipeline stdin writer code was duplicated across normal and timeout execution, and
    both detached copies silently discarded write failures.
 
-### SAFE-001 — 6
+### SAFE-001 — 7
 
 1. The typed-manifest example used an untrusted manifest name as an output path component.
 2. Managed Unix temporary files/directories used ambient permissions instead of
@@ -62,6 +65,8 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
 5. Secret workflow values could still be interpolated into child argv after input-time
    redaction protections were added.
 6. Redaction ignored list and record leaves because it only handled scalar secret values.
+7. Boolean and short-integer secret leaves were used as global substring replacement
+   keys, corrupting unrelated trace text and digit substrings inside larger numbers.
 
 ### Single-occurrence categories
 
@@ -72,6 +77,8 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
   effects remain visible.
 - OPS-001: a double-quoted `gh pr create --body` argument executed Markdown backticks as
   shell command substitution instead of passing the body literally.
+- DRY-001: metadata statements read files that preceding dry-run effects intentionally
+  did not create.
 
 ## Updating this file
 

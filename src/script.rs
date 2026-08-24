@@ -91,7 +91,15 @@ fn include_wait_would_cycle(
     registry: &IncludeRegistry,
     current: thread::ThreadId,
     mut owner: thread::ThreadId,
+    include_chain: &[PathBuf],
 ) -> bool {
+    if registry
+        .active
+        .iter()
+        .any(|(path, active_owner)| *active_owner == owner && include_chain.contains(path))
+    {
+        return true;
+    }
     let mut visited = HashSet::new();
     while visited.insert(owner) {
         let Some(waited_path) = registry.waiting.get(&owner) else {
@@ -257,6 +265,7 @@ impl Script {
             report: ScriptReport::default(),
             source_dirs: vec![context.cwd().to_owned()],
             includes: Arc::new((Mutex::new(IncludeRegistry::default()), Condvar::new())),
+            include_chain: Vec::new(),
             last_value: Value::Missing,
             temporary_paths: Arc::new(Mutex::new(Vec::new())),
         };
@@ -280,6 +289,9 @@ struct Runtime {
     report: ScriptReport,
     source_dirs: Vec<PathBuf>,
     includes: Arc<(Mutex<IncludeRegistry>, Condvar)>,
+    // Branch-local. Parallel clones inherit their logical ancestry so include
+    // re-entry is detected even when the owning thread is blocked in `join`.
+    include_chain: Vec<PathBuf>,
     last_value: Value,
     temporary_paths: Arc<Mutex<Vec<PathBuf>>>,
 }
@@ -900,6 +912,21 @@ impl Runtime {
 
     fn metadata(&mut self, name: &str, source: &str, modified: bool) -> Result<()> {
         let path = resolve(self.context.cwd(), &self.expand_single(source)?);
+        self.trace(&format!(
+            "{} {}",
+            if modified {
+                "modified_time"
+            } else {
+                "file_size"
+            },
+            path.display()
+        ));
+        if self.options.dry_run {
+            let value = Value::Integer(0);
+            self.variables.insert(name.into(), value.clone());
+            self.last_value = value;
+            return Ok(());
+        }
         let metadata = std::fs::metadata(&path)
             .map_err(|e| Error::io("read metadata", Some(path.clone()), e))?;
         let number = if modified {
@@ -932,6 +959,12 @@ impl Runtime {
         let path = resolve(base, &requested);
         let path = std::fs::canonicalize(&path)
             .map_err(|error| Error::io("resolve include", Some(path), error))?;
+        if self.include_chain.contains(&path) {
+            return Err(Error::message(format!(
+                "include cycle detected at {}",
+                path.display()
+            )));
+        }
         let current_thread = thread::current().id();
         let includes = Arc::clone(&self.includes);
         let (lock, changed) = &*includes;
@@ -946,7 +979,12 @@ impl Runtime {
             }
             if let Some(owner) = registry.active.get(&path).copied() {
                 if owner == current_thread
-                    || include_wait_would_cycle(&registry, current_thread, owner)
+                    || include_wait_would_cycle(
+                        &registry,
+                        current_thread,
+                        owner,
+                        &self.include_chain,
+                    )
                 {
                     return Err(Error::message(format!(
                         "include cycle detected at {}",
@@ -964,6 +1002,7 @@ impl Runtime {
         let variables_before = self.variables.clone();
         let functions_before = self.functions.clone();
         let secrets_before = self.secrets.clone();
+        self.include_chain.push(path.clone());
         let result = (|| {
             let source = std::fs::read_to_string(&path)
                 .map_err(|error| Error::io("read include", Some(path.clone()), error))?;
@@ -978,6 +1017,7 @@ impl Runtime {
             self.source_dirs.pop();
             result
         })();
+        self.include_chain.pop();
         let mut registry = lock.lock().expect("include registry poisoned");
         registry.active.remove(&path);
         if result.is_ok() {
@@ -2206,8 +2246,10 @@ fn words_with_secret_metadata(
 fn redact_value_leaves(secret: &Value, output: &mut String) {
     match secret {
         Value::String(value) if !value.is_empty() => *output = output.replace(value, "[REDACTED]"),
-        Value::Boolean(value) => *output = output.replace(&value.to_string(), "[REDACTED]"),
-        Value::Integer(value) => *output = output.replace(&value.to_string(), "[REDACTED]"),
+        // Boolean spellings and short integers are too common to safely use as
+        // substring redaction keys; they corrupt unrelated trace text.
+        Value::Boolean(_) => {}
+        Value::Integer(value) => redact_distinctive_integer(*value, output),
         Value::List(values) => {
             for value in values {
                 redact_value_leaves(value, output);
@@ -2220,4 +2262,33 @@ fn redact_value_leaves(secret: &Value, output: &mut String) {
         }
         Value::Missing | Value::String(_) => {}
     }
+}
+
+fn redact_distinctive_integer(secret: i64, output: &mut String) {
+    let rendered = secret.to_string();
+    if rendered.trim_start_matches('-').len() < 4 {
+        return;
+    }
+    let mut redacted = String::with_capacity(output.len());
+    let mut start = 0;
+    for (index, _) in output.match_indices(&rendered) {
+        let before_is_digit = !rendered.starts_with('-')
+            && output[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_ascii_digit());
+        let end = index + rendered.len();
+        let after_is_digit = output[end..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit());
+        if before_is_digit || after_is_digit {
+            continue;
+        }
+        redacted.push_str(&output[start..index]);
+        redacted.push_str("[REDACTED]");
+        start = end;
+    }
+    redacted.push_str(&output[start..]);
+    *output = redacted;
 }

@@ -44,6 +44,10 @@ capture revision <- git rev-parse --short HEAD
 Values use the small typed model described below. `capture` produces a UTF-8 string and removes trailing CR/LF characters.
 Undefined variables are errors. Secrets behave like ordinary values except that their
 contents are replaced with `[REDACTED]` in trace output.
+Boolean and one-to-three-digit integer secret leaves are deliberately not used as global
+substring-redaction keys because values such as `true`, `1`, or `12` would corrupt
+unrelated diagnostics. Integers with at least four digits are redacted only at digit
+boundaries, so a secret `1234` does not alter `912345`.
 Secret values, including values created with `secret NAME = VALUE`, are rejected when
 interpolated into a command program or argument. Use an explicit per-command environment
 override or explicit stdin instead. Environment bindings may expand secrets because the

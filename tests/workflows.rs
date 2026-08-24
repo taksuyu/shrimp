@@ -767,6 +767,26 @@ fn file_metadata_produces_integer_values() {
 }
 
 #[test]
+fn dry_run_metadata_does_not_read_files_suppressed_by_dry_run() {
+    let root = sandbox("dry-run-metadata");
+    let script = shrimp::Script::parse(
+        "write \"future/file\" <- contents\nfile_size bytes <- \"future/file\"\nmodified_time changed <- \"future/file\"\n",
+    )
+    .unwrap();
+    script
+        .run_with_options(
+            &Context::new(&root),
+            shrimp::ScriptOptions {
+                dry_run: true,
+                trace: false,
+            },
+        )
+        .unwrap();
+    assert!(!root.join("future").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn typed_conditions_preserve_quotes_whitespace_and_nested_lookup() {
     let root = sandbox("condition-token-metadata");
     let source = r#"
@@ -979,6 +999,26 @@ fn cross_thread_include_cycles_fail_instead_of_deadlocking() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn parallel_include_lineage_reentry_fails_instead_of_deadlocking() {
+    let root = sandbox("parallel-include-lineage");
+    std::fs::write(
+        root.join("root.shrimp"),
+        "parallel\n  include \"root.shrimp\"\nend\n",
+    )
+    .unwrap();
+    let script = shrimp::Script::parse("include \"root.shrimp\"\n").unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let context = Context::new(&root);
+    std::thread::spawn(move || sender.send(script.run(&context)).unwrap());
+    let error = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("parallel include lineage re-entry deadlocked")
+        .unwrap_err();
+    assert!(error.to_string().contains("include cycle detected"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn early_stdin_close_is_treated_as_broken_pipe_not_failure() {
@@ -1150,5 +1190,28 @@ fn trace_redacts_secret_list_and_record_leaves() {
     assert!(!trace.contains("list-secret"), "{trace}");
     assert!(!trace.contains("record-secret"), "{trace}");
     assert!(trace.matches("[REDACTED]").count() >= 2, "{trace}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_does_not_redact_low_entropy_typed_secrets_or_integer_substrings() {
+    let root = sandbox("typed-secret-redaction-boundaries");
+    let script = root.join("typed-secrets.shrimp");
+    std::fs::write(
+        &script,
+        "secret flag = true\nsecret small = 12\nsecret distinctive = 1234\nprint \"flag=${flag} small=${small} exact=${distinctive} larger=912345\"\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_shrimp"))
+        .args(["--trace", script.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let trace = String::from_utf8(output.stderr).unwrap();
+    assert!(trace.contains("flag=true"), "{trace}");
+    assert!(trace.contains("small=12"), "{trace}");
+    assert!(trace.contains("exact=[REDACTED]"), "{trace}");
+    assert!(trace.contains("larger=912345"), "{trace}");
     std::fs::remove_dir_all(root).unwrap();
 }
