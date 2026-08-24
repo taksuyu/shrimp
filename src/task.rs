@@ -14,6 +14,7 @@ use std::{
 pub struct Context {
     cwd: PathBuf,
     env: HashMap<OsString, OsString>,
+    arguments: HashMap<String, String>,
 }
 
 impl Default for Context {
@@ -21,6 +22,7 @@ impl Default for Context {
         Self {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             env: HashMap::new(),
+            arguments: HashMap::new(),
         }
     }
 }
@@ -30,6 +32,7 @@ impl Context {
         Self {
             cwd: cwd.into(),
             env: HashMap::new(),
+            arguments: HashMap::new(),
         }
     }
     pub fn cwd(&self) -> &Path {
@@ -41,6 +44,14 @@ impl Context {
     pub fn with_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.env.insert(key.into(), value.into());
         self
+    }
+    /// Supplies an explicitly declared workflow argument without adding it to child environments.
+    pub fn with_argument(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.arguments.insert(key.into(), value.into());
+        self
+    }
+    pub(crate) fn arguments(&self) -> &HashMap<String, String> {
+        &self.arguments
     }
     pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = cwd.into();

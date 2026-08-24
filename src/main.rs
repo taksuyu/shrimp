@@ -31,7 +31,7 @@ fn run() -> shrimp::Result<()> {
     }
     let Some(path) = args.next() else {
         eprintln!(
-            "Usage: shrimp [--check] [--dry-run] [--trace] <workflow.shrimp> [NAME=VALUE ...]\n\nRun a portable Shrimp workflow. Extra NAME=VALUE arguments become variables."
+            "Usage: shrimp [--check] [--dry-run] [--trace] <workflow.shrimp> [NAME=VALUE ...]\n\nRun a portable Shrimp workflow. Extra NAME=VALUE arguments satisfy explicit `arg NAME` declarations."
         );
         return Err(shrimp::Error::message("missing script path"));
     };
@@ -50,12 +50,15 @@ fn run() -> shrimp::Result<()> {
         std::fs::canonicalize(cwd)
             .map_err(|e| shrimp::Error::message(format!("resolve script directory: {e}")))?,
     );
+    for (name, value) in std::env::vars_os() {
+        context = context.with_env(name, value);
+    }
     for argument in args {
         let argument = argument.to_string_lossy();
         let (name, value) = argument.split_once('=').ok_or_else(|| {
             shrimp::Error::message(format!("expected NAME=VALUE, got `{argument}`"))
         })?;
-        context = context.with_env(name, value);
+        context = context.with_argument(name, value);
     }
     let script = Script::from_file(&path)?;
     if check {

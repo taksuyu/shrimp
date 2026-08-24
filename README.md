@@ -56,8 +56,21 @@ $ cargo build --profile "${profile}"
 print "built ${revision}"
 ```
 
-Captured output has trailing newlines removed. Variables supplied on the command line
-are available to interpolation and child processes:
+Captured output has trailing newlines removed. External inputs must be declared before
+use, making the workflow's interface visible at the top of the file:
+
+```shrimp
+arg ENV
+arg VERSION
+env HOME
+secret env DEPLOY_TOKEN
+```
+
+`arg NAME` is satisfied by a `NAME=VALUE` runner argument. `env NAME` explicitly imports
+one ambient process environment variable. `secret env NAME` also redacts its value from
+traces and diagnostics. Values that were supplied but never declared are unavailable to
+interpolation. Child processes still inherit the runner environment in the ordinary OS
+way; declarations control workflow values, not process inheritance.
 
 ```console
 shrimp deploy.shrimp ENV=staging VERSION=1.2.3
@@ -75,11 +88,16 @@ append "target/package/log" <- "built ${revision}\n"
 copy "assets/config.json" -> "target/package/config.json"
 remove "target/package/obsolete.txt"
 cd "subproject"
+with cwd "nested-project"
+  $ cargo build
+end
 ```
 
 `write` uses a same-directory temporary file and rename, so readers never observe a
 partially written result. Paths are relative to the script directory, not whichever
 directory happened to launch Shrimp.
+`cd` persists in the current branch; `with cwd PATH ... end` restores the previous
+command/filesystem context after its block. Include resolution remains source-relative.
 
 ### Conditions and retries
 
@@ -131,7 +149,9 @@ $ deploy --token "${token}"
 ```
 
 `>`, `>>`, and `2>` redirect final process output. `--trace` prints expanded actions;
-values declared with `secret` are replaced by `[REDACTED]` in traces. `--dry-run`
+values declared with `secret` are replaced by `[REDACTED]` in traces. With `--trace`,
+Shrimp logs each declared argument/environment input by name and safely expanded commands.
+`--dry-run`
 prints the plan without launching commands or changing files.
 
 ### Comments and continuation
@@ -175,11 +195,17 @@ Implemented now:
 - typed values, typed conditions, list indexing, and typed function results;
 - explicit file/value stdin and per-command environment overrides;
 - managed temporary paths and integer file metadata.
+- explicit required workflow arguments and ambient-environment imports;
 
 The initial language contract is documented in [`docs/language.md`](docs/language.md).
 Remaining production-hardening work includes Windows job-object cancellation, parallel
 write collision checks, file durability policy, and a compatibility/versioning policy
 once the syntax has had real-world use.
+
+Commands currently run with the runner's OS permissions. A default-on subprocess
+sandbox with an explicit `--no-sandbox` escape hatch is documented as high-difficulty
+future work. Interpreter-only path checks are intentionally not presented as a security
+sandbox because directly invoked tools could bypass them.
 
 ## Rust embedding API
 

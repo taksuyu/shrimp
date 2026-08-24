@@ -993,3 +993,87 @@ fn early_stdin_close_is_treated_as_broken_pipe_not_failure() {
         .run_timeout(&Context::default(), Duration::from_secs(1))
         .unwrap();
 }
+
+#[test]
+fn workflow_arguments_must_be_declared_explicitly() {
+    let root = sandbox("explicit-arguments");
+    let script =
+        shrimp::Script::parse("arg PROFILE\nwrite \"result\" <- \"${PROFILE}\"\n").unwrap();
+    script
+        .run(&Context::new(&root).with_argument("PROFILE", "release"))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "release"
+    );
+
+    let error = script.run(&Context::new(&root)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("required workflow argument `PROFILE`")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn with_cwd_is_scoped_while_cd_is_persistent() {
+    let root = sandbox("scoped-cwd");
+    std::fs::create_dir_all(root.join("one/two")).unwrap();
+    let script = shrimp::Script::parse(
+        "with cwd \"one\"\n  write \"scoped\" <- yes\n  with cwd \"two\"\n    write \"nested\" <- yes\n  end\nend\nwrite \"root\" <- yes\ncd \"one\"\nwrite \"persistent\" <- yes\n",
+    )
+    .unwrap();
+    script.run(&Context::new(&root)).unwrap();
+    assert!(root.join("one/scoped").exists());
+    assert!(root.join("one/two/nested").exists());
+    assert!(root.join("root").exists());
+    assert!(root.join("one/persistent").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn undeclared_context_values_are_not_workflow_variables() {
+    let script = shrimp::Script::parse("print \"${UNDECLARED}\"\n").unwrap();
+    let error = script
+        .run(&Context::default().with_argument("UNDECLARED", "hidden"))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("undefined variable `UNDECLARED`")
+    );
+}
+
+#[test]
+fn missing_explicit_environment_inputs_are_line_aware() {
+    let name = format!("SHRIMP_TEST_MISSING_ENV_{}", std::process::id());
+    let script = shrimp::Script::parse(&format!("env {name}\n")).unwrap();
+    let error = script.run(&Context::default()).unwrap_err();
+    assert!(error.to_string().contains("script line 1"));
+    assert!(error.to_string().contains("required environment variable"));
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_logs_declared_inputs_and_redacts_secret_environment_values() {
+    let root = sandbox("input-trace");
+    let script = root.join("inputs.shrimp");
+    std::fs::write(
+        &script,
+        "arg PROFILE\nsecret env SHRIMP_TRACE_TOKEN\n$ printf %s ${PROFILE}:${SHRIMP_TRACE_TOKEN}\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_shrimp"))
+        .args(["--trace", script.to_str().unwrap(), "PROFILE=release"])
+        .env("SHRIMP_TRACE_TOKEN", "private-token")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let trace = String::from_utf8(output.stderr).unwrap();
+    assert!(trace.contains("use arg PROFILE"), "{trace}");
+    assert!(trace.contains("use env SHRIMP_TRACE_TOKEN"), "{trace}");
+    assert!(trace.contains("[REDACTED]"), "{trace}");
+    assert!(!trace.contains("private-token"), "{trace}");
+    std::fs::remove_dir_all(root).unwrap();
+}

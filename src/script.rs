@@ -114,6 +114,11 @@ fn include_wait_would_cycle(
 
 #[derive(Clone, Debug)]
 enum StatementKind {
+    Input {
+        name: String,
+        environment: bool,
+        secret: bool,
+    },
     Let {
         name: String,
         value: String,
@@ -133,6 +138,10 @@ enum StatementKind {
         command: String,
     },
     Cd(String),
+    WithCwd {
+        path: String,
+        body: Vec<Statement>,
+    },
     Mkdir(String),
     Write {
         path: String,
@@ -241,19 +250,9 @@ impl Script {
         context: &Context,
         options: ScriptOptions,
     ) -> Result<ScriptReport> {
-        let variables = context
-            .env()
-            .iter()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().into_owned(),
-                    Value::String(value.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
         let mut runtime = Runtime {
             context: context.clone(),
-            variables,
+            variables: HashMap::new(),
             secrets: HashSet::new(),
             functions: HashMap::new(),
             call_depth: 0,
@@ -301,6 +300,38 @@ impl Runtime {
     fn execute_one(&mut self, statement: &Statement) -> Result<()> {
         self.last_value = Value::Missing;
         match &statement.kind {
+            StatementKind::Input {
+                name,
+                environment,
+                secret,
+            } => {
+                let value = if *environment {
+                    self.context
+                        .env()
+                        .get(std::ffi::OsStr::new(name))
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .ok_or_else(|| {
+                            Error::message(format!(
+                                "required environment variable `{name}` is not set"
+                            ))
+                        })?
+                } else {
+                    self.context.arguments().get(name).cloned().ok_or_else(|| {
+                        Error::message(format!(
+                            "required workflow argument `{name}` was not provided"
+                        ))
+                    })?
+                };
+                if *secret {
+                    self.secrets.insert(name.clone());
+                }
+                self.variables.insert(name.clone(), Value::String(value));
+                self.last_value = self.variables[name].clone();
+                self.trace(&format!(
+                    "use {} {name}",
+                    if *environment { "env" } else { "arg" }
+                ));
+            }
             StatementKind::Let {
                 name,
                 value,
@@ -390,6 +421,15 @@ impl Runtime {
                 let path = resolve(self.context.cwd(), &self.expand_single(path)?);
                 self.trace(&format!("cd {}", path.display()));
                 self.context = self.context.clone().with_cwd(path);
+            }
+            StatementKind::WithCwd { path, body } => {
+                let path = resolve(self.context.cwd(), &self.expand_single(path)?);
+                self.trace(&format!("with cwd {}", path.display()));
+                let saved = self.context.clone();
+                self.context = self.context.clone().with_cwd(path);
+                let result = self.execute(body);
+                self.context = saved;
+                result?;
             }
             StatementKind::Mkdir(path) => {
                 let path = self.expand_single(path)?;
@@ -1408,6 +1448,13 @@ fn parse_block(
                 yes,
                 no,
             }
+        } else if let Some(path) = text.strip_prefix("with cwd ") {
+            let (body, end) = parse_block(lines, position, true)?;
+            require_end(*line, end)?;
+            StatementKind::WithCwd {
+                path: path.into(),
+                body,
+            }
         } else if let Some(rest) = text.strip_prefix("for ") {
             let (name, source) = split_operator_optional(rest, " in ")?.ok_or_else(|| {
                 script_error(*line, "for syntax: for NAME in glob|lines|words VALUE")
@@ -1528,7 +1575,28 @@ fn parse_values(line: usize, source: &str) -> Result<Values> {
 }
 
 fn parse_statement(line: usize, text: &str) -> Result<Statement> {
-    let kind = if let Some(rest) = text.strip_prefix("let ") {
+    let kind = if let Some(name) = text.strip_prefix("arg ") {
+        valid_name(name)?;
+        StatementKind::Input {
+            name: name.into(),
+            environment: false,
+            secret: false,
+        }
+    } else if let Some(name) = text.strip_prefix("secret arg ") {
+        valid_name(name)?;
+        StatementKind::Input {
+            name: name.into(),
+            environment: false,
+            secret: true,
+        }
+    } else if let Some(name) = text.strip_prefix("secret env ") {
+        valid_name(name)?;
+        StatementKind::Input {
+            name: name.into(),
+            environment: true,
+            secret: true,
+        }
+    } else if let Some(rest) = text.strip_prefix("let ") {
         assignment(rest, false)?
     } else if let Some(rest) = text.strip_prefix("secret ") {
         assignment(rest, true)?
@@ -1543,8 +1611,17 @@ fn parse_statement(line: usize, text: &str) -> Result<Statement> {
         }
     } else if let Some(command) = text.strip_prefix("$ ") {
         StatementKind::Run(command.into())
-    } else if text.starts_with("env ") && text.contains(" $ ") {
-        StatementKind::Run(text.into())
+    } else if let Some(rest) = text.strip_prefix("env ") {
+        if split_operator_optional(rest, " $ ")?.is_some() {
+            StatementKind::Run(text.into())
+        } else {
+            valid_name(rest)?;
+            StatementKind::Input {
+                name: rest.into(),
+                environment: true,
+                secret: false,
+            }
+        }
     } else if let Some(rest) = text.strip_prefix("retry ") {
         let (count, command) = rest
             .split_once(' ')

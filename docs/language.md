@@ -16,6 +16,21 @@ the escapes `\n`, `\t`, `\\`, and escaped quotes. Expansions always remain one a
 
 ## Values
 
+Workflow entry points declare external inputs explicitly:
+
+```shrimp
+arg PROFILE
+env HOME
+secret arg API_TOKEN
+secret env DEPLOY_TOKEN
+```
+
+Required `arg` declarations read `NAME=VALUE` arguments passed after the script path;
+required `env` declarations read the runner's ambient environment. Missing inputs are
+line-aware errors. Supplying an argument does not implicitly create a workflow variable,
+and importing an environment value does not mutate the environment. Secret forms redact
+the imported value. Trace mode records input use by name without logging secret values.
+
 ```shrimp
 let name = "ordinary value"
 secret token = "${TOKEN_FROM_ENV}"
@@ -84,6 +99,9 @@ process in the pipeline, and they do not mutate later commands or the Shrimp run
 
 ```shrimp
 cd "subdirectory"
+with cwd "subproject"
+  $ cargo build
+end
 mkdir "output"
 write "output/value" <- "complete contents\n"
 append "output/log" <- "one more line\n"
@@ -94,6 +112,10 @@ remove --recursive --force "generated-tree"
 
 `write` creates a same-directory temporary file and renames it over the destination.
 It creates missing parent directories. `remove` fails for absent files.
+`cd` changes the current branch context persistently. `with cwd PATH ... end` changes
+it only for that logical block and restores the prior context even when the block
+fails. Includes remain relative to their containing source file rather than command
+working-directory context.
 `remove --recursive --force` removes a file or directory tree and succeeds when the
 path is already absent, making it suitable for clean workspace builds.
 
@@ -213,7 +235,8 @@ inner loops or blocks from multiplying the concurrency selected by the outer wor
 shrimp [--check] [--dry-run] [--trace] workflow.shrimp [NAME=VALUE ...]
 ```
 
-`NAME=VALUE` entries initialize both workflow variables and child environment values.
+`NAME=VALUE` entries satisfy matching `arg NAME` declarations. Unused entries are not
+workflow variables and are not copied into the child environment.
 `--trace` writes expanded actions to stderr before execution. `--dry-run` implies
 tracing and suppresses process and filesystem effects; captures become empty strings
 and conditions choose their success branch so the plan can continue.
@@ -283,7 +306,14 @@ These are design notes, not implemented syntax or commitments:
 | Recursive include checking | Have `--check` follow statically resolvable include files | Medium | Interpolated paths cannot always be resolved without evaluating bindings; literal paths can be checked safely without running effects. |
 | Namespaced modules | `import "release.shrimp" as release`, then `call release.publish ...` | High | Requires exports, qualified symbol tables, initialization and isolation rules, duplicate identity handling, and compatibility policy. `include` should remain sufficient until real workflows demonstrate this need. |
 | Windows process-tree cancellation | Put timed children in a Windows Job Object | High | This is platform process-management work and needs Windows integration coverage; direct-child termination is not production-grade tree management. |
+| Default process sandbox | Run sandboxed unless the runner receives an explicit `--no-sandbox` escape hatch | High | Filesystem path checks in the interpreter cannot contain directly executed tools. A real default must cover subprocess descendants and filesystem/network access through platform backends (for example Linux namespaces/seccomp, macOS sandbox facilities, and Windows restricted tokens/Job Objects), define toolchain mounts, and fail closed when unavailable. |
 
 Other explicit non-goals remain a shell-compatible parser, implicit shell execution,
 arithmetic/general expressions, package management, dependency graphs, caching, remote
 execution, and plugins.
+
+Shrimp does **not** currently claim to sandbox commands. They run directly with the
+runner's OS permissions and can access paths that language-level path validation cannot
+see. Adding a flag that guarded only Shrimp's built-in file statements would create a
+false security boundary, so the proposed default sandbox must be implemented at process
+level before the runner advertises it.
