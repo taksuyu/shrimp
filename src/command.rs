@@ -47,21 +47,65 @@ impl Cmd {
         self.cwd = Some(path.into());
         self
     }
+    /// Connects this command to another command in an ordered pipeline.
+    
+    ///
+    
+    /// # Examples
+    
+    ///
+    
+    /// ```
+    
+    /// let pipeline = Cmd::new("echo").pipe(Cmd::new("cat"));
+    
+    /// ```
     pub fn pipe(self, next: Cmd) -> Pipeline {
         Pipeline {
             commands: vec![self, next],
             stdin: None,
         }
     }
+    /// Creates a pipeline containing this command as its first command.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pipeline = Cmd::new("echo").pipeline();
+    /// ```
     pub fn pipeline(self) -> Pipeline {
         Pipeline {
             commands: vec![self],
             stdin: None,
         }
     }
+    /// Wraps command execution in a task.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let task = Cmd::new("echo").arg("hello").task();
+    /// ```
     pub fn task(self) -> Task<CommandOutput> {
         Task::new(move |ctx| self.run(ctx))
     }
+    /// Executes the command and returns its output.
+    ///
+    /// A non-successful exit status is returned as a command failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let output = Cmd::new("echo")
+    ///     .arg("hello")
+    ///     .run(&Context::default())?;
+    /// assert_eq!(output.stdout_string()?, "hello\n");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command cannot be executed or exits unsuccessfully.
     pub fn run(&self, context: &Context) -> Result<CommandOutput> {
         Pipeline {
             commands: vec![self.clone()],
@@ -69,7 +113,16 @@ impl Cmd {
         }
         .run(context)
     }
-    /// Runs without converting a non-zero exit status into an error.
+    /// Executes the command and returns its output regardless of its exit status.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// let command = Cmd::new("echo").arg("hello");
+    /// let output = command.run_unchecked(&Context::default())?;
+    /// # let _ = output;
+    /// # Ok::<(), Error>(())
+    /// ```
     pub fn run_unchecked(&self, context: &Context) -> Result<CommandOutput> {
         Pipeline {
             commands: vec![self.clone()],
@@ -136,11 +189,34 @@ pub struct Pipeline {
 type PipelineFailure = (String, ExitStatus, Vec<u8>);
 
 impl Pipeline {
-    /// Feeds these bytes to the first process without invoking a shell.
+    /// Supplies input bytes to the first process in the pipeline without invoking a shell.
+    
+    ///
+    
+    /// # Examples
+    
+    ///
+    
+    /// ```
+    
+    /// let pipeline = Cmd::new("cat")
+    
+    ///     .pipe(Cmd::new("cat"))
+    
+    ///     .stdin("input");
+    
+    /// ```
     pub fn stdin(mut self, input: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(input.into());
         self
     }
+    /// Appends a command to the pipeline.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pipeline = Cmd::new("echo").pipe(Cmd::new("cat"));
+    /// ```
     pub fn pipe(mut self, next: Cmd) -> Self {
         self.commands.push(next);
         self
@@ -174,7 +250,19 @@ impl Pipeline {
         Ok(failure.is_none())
     }
 
-    /// Runs a pipeline with a deadline and kills every direct child on expiry.
+    /// Executes the pipeline until all processes and output streams complete or the deadline expires.
+    ///
+    /// On expiry, terminates the pipeline's process tree and returns [`Error::Timeout`]. A non-successful
+    /// command returns [`Error::CommandFailed`] using pipefail semantics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pipeline = Cmd::new("printf").arg("done");
+    /// let output = pipeline.run_timeout(&Context::default(), Duration::from_secs(1))?;
+    /// assert_eq!(output.stdout_string()?, "done");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn run_timeout(&self, context: &Context, limit: Duration) -> Result<CommandOutput> {
         if self.commands.is_empty() {
             return Err(Error::EmptyPipeline);
@@ -296,6 +384,17 @@ impl Pipeline {
         })
     }
 
+    /// Executes the pipeline and reports its output together with the first command failure, if any.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let (output, failure) = pipeline.execute(&context)?;
+    /// assert!(failure.is_none());
+    /// # Ok::<(), Error>(())
+    /// ```
+    ///
+    /// Returns an error if the pipeline is empty or a command cannot be spawned or waited for.
     fn execute(&self, context: &Context) -> Result<(CommandOutput, Option<PipelineFailure>)> {
         if self.commands.is_empty() {
             return Err(Error::EmptyPipeline);
@@ -384,6 +483,18 @@ impl Pipeline {
     }
 }
 
+/// Reads all available bytes from an optional reader.
+///
+/// Returns an empty vector when no reader is provided.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Cursor;
+///
+/// let output = read_all(Some(Cursor::new(b"hello"))).unwrap();
+/// assert_eq!(output, b"hello");
+/// ```
 fn read_all<R: Read>(reader: Option<R>) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     if let Some(mut reader) = reader {
@@ -394,6 +505,28 @@ fn read_all<R: Read>(reader: Option<R>) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Writes command input on a background thread and reports the result through a channel.
+///
+/// Broken-pipe errors are treated as successful completion because the command may
+/// exit before consuming all input.
+///
+/// # Examples
+///
+/// ```
+/// use std::process::{Command, Stdio};
+///
+/// let mut child = Command::new("cat")
+///     .stdin(Stdio::piped())
+///     .spawn()
+///     .unwrap();
+/// let stdin = child.stdin.take().unwrap();
+/// let result = spawn_stdin_writer(stdin, b"input".to_vec())
+///     .recv()
+///     .unwrap();
+///
+/// assert!(result.is_ok());
+/// child.wait().unwrap();
+/// ```
 fn spawn_stdin_writer(mut stdin: std::process::ChildStdin, input: Vec<u8>) -> Receiver<Result<()>> {
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
@@ -410,6 +543,20 @@ fn spawn_stdin_writer(mut stdin: std::process::ChildStdin, input: Vec<u8>) -> Re
     receiver
 }
 
+/// Checks whether the asynchronous command stdin writer has completed and reports any failure.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::mpsc::channel;
+///
+/// let (sender, receiver) = channel();
+/// sender.send(Ok::<(), Error>(())).unwrap();
+/// let mut complete = false;
+///
+/// poll_stdin_writer(&receiver, &mut complete).unwrap();
+/// assert!(complete);
+/// ```
 fn poll_stdin_writer(receiver: &Receiver<Result<()>>, complete: &mut bool) -> Result<()> {
     if *complete {
         return Ok(());
@@ -427,12 +574,33 @@ fn poll_stdin_writer(receiver: &Receiver<Result<()>>, complete: &mut bool) -> Re
     Ok(())
 }
 
+/// Waits for the stdin writer to finish and returns its result.
+///
+/// # Examples
+///
+/// ```
+/// let (sender, receiver) = std::sync::mpsc::channel();
+/// sender.send(Ok(())).unwrap();
+///
+/// assert!(finish_stdin_writer(receiver).is_ok());
+/// ```
 fn finish_stdin_writer(receiver: Receiver<Result<()>>) -> Result<()> {
     receiver
         .recv()
         .map_err(|_| Error::message("command stdin writer stopped unexpectedly"))?
 }
 
+/// Reads all data from an optional reader on a background thread.
+///
+/// # Examples
+///
+/// ```
+/// let output = spawn_reader(Some(std::io::Cursor::new(b"hello".to_vec())))
+///     .recv()
+///     .unwrap()
+///     .unwrap();
+/// assert_eq!(output, b"hello");
+/// ```
 fn spawn_reader<R: Read + Send + 'static>(reader: Option<R>) -> Receiver<Result<Vec<u8>>> {
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {

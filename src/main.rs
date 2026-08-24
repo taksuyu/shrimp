@@ -11,6 +11,17 @@ fn main() -> ExitCode {
     }
 }
 
+/// Runs the Shrimp command-line workflow with the selected execution options.
+///
+/// Supports syntax checking, dry runs, tracing, help output, process environment
+/// variables, and explicit `NAME=VALUE` workflow arguments.
+///
+/// # Examples
+///
+/// ```text
+/// shrimp --check workflow.shrimp
+/// ```
+fn run() -> shrimp::Result<()> {
 fn run() -> shrimp::Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
     let mut options = ScriptOptions::default();

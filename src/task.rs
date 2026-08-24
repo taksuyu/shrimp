@@ -18,6 +18,15 @@ pub struct Context {
 }
 
 impl Default for Context {
+    /// Creates an empty context using the current working directory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let context = Context::default();
+    /// assert!(context.env.is_empty());
+    /// assert!(context.arguments.is_empty());
+    /// ```
     fn default() -> Self {
         Self {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -28,6 +37,16 @@ impl Default for Context {
 }
 
 impl Context {
+    /// Creates a context with the specified working directory and empty environment and argument maps.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let context = Context::new("/workspace");
+    /// assert_eq!(context.cwd, std::path::PathBuf::from("/workspace"));
+    /// assert!(context.env.is_empty());
+    /// assert!(context.arguments.is_empty());
+    /// ```
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
             cwd: cwd.into(),
@@ -35,24 +54,68 @@ impl Context {
             arguments: HashMap::new(),
         }
     }
+    /// Provides the working directory associated with this context.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let context = Context::new();
+    /// assert_eq!(context.cwd(), std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+    /// ```
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
     pub fn env(&self) -> &HashMap<OsString, OsString> {
         &self.env
     }
+    /// Adds an environment variable to the context.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let context = Context::default().with_env("MODE", "test");
+    ///
+    /// assert_eq!(
+    ///     context.env.get("MODE"),
+    ///     Some(&std::ffi::OsString::from("test"))
+    /// );
+    /// ```
     pub fn with_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.env.insert(key.into(), value.into());
         self
     }
-    /// Supplies an explicitly declared workflow argument without adding it to child environments.
+    /// Adds a workflow argument without adding it to child environments.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let context = Context::default().with_argument("name", "value");
+    /// assert_eq!(context.arguments.get("name"), Some(&"value".to_owned()));
+    /// ```
     pub fn with_argument(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.arguments.insert(key.into(), value.into());
         self
     }
+    /// Provides access to the workflow arguments stored in the context.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let context = Context::default();
+    /// assert!(context.arguments().is_empty());
+    /// ```
+    pub(crate) fn arguments(&self) -> &HashMap<String, String> {
     pub(crate) fn arguments(&self) -> &HashMap<String, String> {
         &self.arguments
     }
+    /// Replaces the working directory used by the context.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let context = Context::new().with_cwd("/tmp/workflow");
+    /// assert_eq!(context.cwd, std::path::PathBuf::from("/tmp/workflow"));
+    /// ```
     pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = cwd.into();
         self

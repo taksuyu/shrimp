@@ -22,6 +22,13 @@ pub fn read_to_string(path: impl Into<PathBuf>) -> Task<String> {
         io("read", &path, std::fs::read_to_string(&path))
     })
 }
+/// Writes byte contents to a path relative to the task context, creating missing parent directories.
+///
+/// # Examples
+///
+/// ```
+/// let task = write("output/data.txt", b"example".to_vec());
+/// ```
 pub fn write(path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> Task<()> {
     let path = path.into();
     let contents = contents.into();
@@ -38,6 +45,26 @@ pub fn create_dir_all(path: impl Into<PathBuf>) -> Task<()> {
         io("create directory", &path, std::fs::create_dir_all(&path))
     })
 }
+/// Creates a task that copies a file to a context-relative destination, creating missing parent directories.
+///
+/// # Examples
+///
+/// ```
+/// let task = copy("source.txt", "backup/source.txt");
+/// ```
+///
+/// # Arguments
+///
+/// * `from` - The context-relative source file path.
+/// * `to` - The context-relative destination file path.
+///
+/// # Returns
+///
+/// The number of bytes copied.
+///
+/// # Errors
+///
+/// The task returns an error if the source cannot be read, the destination cannot be created or written, or a parent directory cannot be created.
 pub fn copy(from: impl Into<PathBuf>, to: impl Into<PathBuf>) -> Task<u64> {
     let from = from.into();
     let to = to.into();
@@ -58,7 +85,16 @@ pub fn remove_file(path: impl Into<PathBuf>) -> Task<()> {
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Writes beside the destination, then renames, preventing readers from seeing partial contents.
+/// Writes contents to a context-relative path by atomically replacing the destination.
+///
+/// Parent directories are created as needed, and readers see either the previous
+/// contents or the complete new contents.
+///
+/// # Examples
+///
+/// ```
+/// let task = write_atomic("output/data.txt", b"complete contents".to_vec());
+/// ```
 pub fn write_atomic(path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> Task<()> {
     let path = path.into();
     let contents = contents.into();
@@ -80,6 +116,26 @@ pub fn write_atomic(path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> T
     })
 }
 
+/// Creates all missing parent directories for a path.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+/// use std::path::PathBuf;
+///
+/// let directory = std::env::temp_dir().join(format!(
+///     "create-parent-example-{}",
+///     std::process::id()
+/// ));
+/// let path = directory.join("nested").join("file.txt");
+///
+/// create_parent(&path)?;
+/// assert!(path.parent().unwrap().is_dir());
+///
+/// fs::remove_dir_all(directory)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub(crate) fn create_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         io(
@@ -91,7 +147,26 @@ pub(crate) fn create_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+/// Replaces the destination path with the file at the source path.
+///
+/// # Examples
+///
+/// ```
+/// # use std::path::Path;
+/// # let source = Path::new("temporary-file");
+/// # let destination = Path::new("destination-file");
+/// # // `atomic_replace` replaces `destination` with `source`.
+/// # let _ = (source, destination);
+/// ```
+///
+/// # Parameters
+///
+/// * `from` — Path to the file being moved.
+/// * `to` — Destination path to replace.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if the replacement fails.
 fn atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
