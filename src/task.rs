@@ -59,7 +59,7 @@ impl Context {
     /// # Examples
     ///
     /// ```text
-    /// let context = Context::new();
+    /// let context = Context::default();
     /// assert_eq!(context.cwd(), std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
     /// ```
     pub fn cwd(&self) -> &Path {

@@ -203,8 +203,8 @@ Implemented now:
 - recursive workspace removal and concurrency-bounded parallel loops;
 - typed values, typed conditions, list indexing, and typed function results;
 - explicit file/value stdin and per-command environment overrides;
-- managed temporary paths and integer file metadata.
-- explicit required workflow arguments and ambient-environment imports;
+- managed temporary paths and integer file metadata;
+- explicit required workflow arguments and ambient-environment imports.
 
 The initial language contract is documented in [`docs/language.md`](docs/language.md).
 Remaining production-hardening work includes Windows job-object cancellation, parallel

@@ -1,4 +1,5 @@
 # Run with --dry-run first to print this workflow's execution plan.
+# Note: This workflow requires GNU coreutils (sha256sum). On macOS, install via: brew install coreutils
 capture manifest <- cat workspace.tsv
 
 for line in lines "${manifest}"

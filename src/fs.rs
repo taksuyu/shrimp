@@ -167,6 +167,7 @@ pub(crate) fn create_parent(path: &Path) -> Result<()> {
 /// # Errors
 ///
 /// Returns the underlying I/O error if the replacement fails.
+#[cfg(not(windows))]
 fn atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
