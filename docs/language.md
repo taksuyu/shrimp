@@ -16,15 +16,42 @@ the escapes `\n`, `\t`, `\\`, and escaped quotes. Expansions always remain one a
 
 ## Values
 
+Workflow entry points declare external inputs explicitly:
+
+```shrimp
+arg PROFILE
+env HOME
+secret env DEPLOY_TOKEN
+```
+
+Required `arg` declarations read `NAME=VALUE` arguments passed after the script path;
+required `env` declarations read the runner's ambient environment. Missing inputs are
+line-aware errors. Supplying an argument does not implicitly create a workflow variable,
+and importing an environment value does not mutate the environment. Secret forms redact
+the imported value. Trace mode records input use by name without logging secret values.
+`secret arg NAME` is rejected because argv is observable through shell history and local
+process inspection before runtime redaction applies. Confidential inputs must use
+`secret env NAME`; environment injection avoids argv exposure but is not presented as a
+replacement for an operating-system or deployment-platform secret store.
+
 ```shrimp
 let name = "ordinary value"
-secret token = "${TOKEN_FROM_ENV}"
+secret env DEPLOY_TOKEN
+env DEPLOY_TOKEN="${DEPLOY_TOKEN}" $ deploy
 capture revision <- git rev-parse --short HEAD
 ```
 
-Values are currently UTF-8 strings. `capture` removes trailing CR/LF characters.
-Undefined variables are errors. Secrets behave like ordinary values except that their
-contents are replaced with `[REDACTED]` in trace output.
+Values use the small typed model described below. `capture` produces a UTF-8 string and removes trailing CR/LF characters.
+Undefined variables are errors. Secrets behave like ordinary values except that trace
+redaction follows the value type, length, and digit-boundary rules below.
+Boolean and one-to-three-digit integer secret leaves are deliberately not used as global
+substring-redaction keys because values such as `true`, `1`, or `12` would corrupt
+unrelated diagnostics. Integers with at least four digits are redacted only at digit
+boundaries, so a secret `1234` does not alter `912345`.
+Secret values, including values created with `secret NAME = VALUE`, are rejected when
+interpolated into a command program or argument. Use an explicit per-command environment
+override or explicit stdin instead. Environment bindings may expand secrets because the
+value is passed through the child environment rather than argv.
 
 Tab-separated input can be named as a record. Field count and field names are
 validated, and fields are accessed with dotted interpolation:
@@ -60,13 +87,33 @@ interactive signals. Windows descendant cleanup will require job objects.
 
 The last pipeline process's stdout/stderr is captured internally. With no redirection
 both streams are emitted. `> path` replaces stdout, `>> path` appends stdout, and
-`2> path` replaces stderr; the non-redirected stream is still emitted. One redirection
-is currently accepted per command statement. Redirection is not accepted on `capture`.
+`2> path` replaces stderr; the non-redirected stream is still emitted. `> discard` or
+`2> discard` drops the selected stream. One output redirection is accepted per command.
+
+`< path` feeds raw file bytes to the first process and `<<< VALUE` feeds an expanded
+scalar's UTF-8 bytes. Input can be combined with a following output redirect. It is
+valid on ordinary commands, capture, retry, and timeout statements. No shell parsing,
+word splitting, command substitution, or implicit encoding conversion is involved.
+An early child exit may close stdin before all input is written; that ordinary broken
+pipe is ignored and command status remains authoritative. Any other stdin write error
+fails the command or timed pipeline instead of silently accepting truncated input.
+
+Per-invocation environment overrides use an explicit prefix:
+
+```shrimp
+env PROFILE="release" COLOR="never" $ cargo build
+```
+
+Names are validated, values remain individual scalar values, overrides apply to every
+process in the pipeline, and they do not mutate later commands or the Shrimp runtime.
 
 ## Files and directories
 
 ```shrimp
 cd "subdirectory"
+with cwd "subproject"
+  $ cargo build
+end
 mkdir "output"
 write "output/value" <- "complete contents\n"
 append "output/log" <- "one more line\n"
@@ -76,9 +123,31 @@ remove --recursive --force "generated-tree"
 ```
 
 `write` creates a same-directory temporary file and renames it over the destination.
-It does not create parent directories. `remove` fails for absent files.
+It creates missing parent directories. `remove` fails for absent files.
+`cd` changes the current branch context persistently. `with cwd PATH ... end` changes
+it only for that logical block and restores the prior context even when the block
+fails. Includes remain relative to their containing source file rather than command
+working-directory context.
 `remove --recursive --force` removes a file or directory tree and succeeds when the
 path is already absent, making it suitable for clean workspace builds.
+
+Temporary paths and integer metadata are explicit:
+
+```shrimp
+temp_file response
+temp_dir staging
+file_size bytes <- "artifact.tar.gz"
+modified_time changed_at <- "artifact.tar.gz"
+```
+
+Temporary statements bind an absolute string path and create it immediately. All
+temporary paths are removed at workflow completion, including error completion;
+parallel branches share the cleanup registry. Dry-run assigns a planned path but does
+not create it. Names use operating-system randomness and creation is exclusive, retrying
+the unlikely event of a collision. On Unix, managed files use mode `0600` and directories
+use `0700`.
+`file_size` returns bytes as an integer. `modified_time` returns whole seconds since
+the Unix epoch as an integer and rejects pre-epoch or overflowing values.
 
 ## Matching
 
@@ -126,8 +195,24 @@ call package "asset.txt" "dist/asset.txt"
 ```
 
 Functions are available after their definition executes. Arguments are positional,
-arity is checked, and variable bindings are restored after a call. Filesystem and
-process effects remain visible.
+typed, and arity-checked; variable bindings are restored after a call. Filesystem and
+process effects remain visible. A function implicitly returns its final statement's
+value. `value VALUE` is a side-effect-free value statement, while assignments, record
+construction, captures, metadata queries, temporary creation, and nested captured calls
+also produce values. Effect-only final statements produce `missing`.
+
+```shrimp
+fn artifact_path name
+  value "target/${name}.tar.gz"
+end
+
+call artifact <- artifact_path "release"
+call artifact_path "debug" # discard the result
+```
+
+There is no early-return statement. `call NAME <- FUNCTION ARG...` preserves lists and
+records rather than serializing them. Parameters are local, while caller bindings are
+restored even when a call fails. The recursion depth limit remains 64.
 
 ## Parallel blocks
 
@@ -161,10 +246,11 @@ inner loops or blocks from multiplying the concurrency selected by the outer wor
 ## Runner
 
 ```console
-shrimp [--dry-run] [--trace] workflow.shrimp [NAME=VALUE ...]
+shrimp [--check] [--dry-run] [--trace] workflow.shrimp [NAME=VALUE ...]
 ```
 
-`NAME=VALUE` entries initialize both workflow variables and child environment values.
+`NAME=VALUE` entries satisfy matching `arg NAME` declarations. Unused entries are not
+workflow variables and are not copied into the child environment.
 `--trace` writes expanded actions to stderr before execution. `--dry-run` implies
 tracing and suppresses process and filesystem effects; captures become empty strings
 and conditions choose their success branch so the plan can continue.
@@ -174,3 +260,74 @@ and conditions choose their success branch so the plan can continue.
 Shrimp exits nonzero on parse errors, missing tools, failed commands, timeouts, file
 errors, bad function arity, or failed parallel branches. Diagnostics include the
 logical source line. A successful run exits zero and reports command/file counts.
+
+## Typed values and conditions (experimental)
+
+Values are strings, booleans, signed 64-bit integers, lists, records, or an internal
+missing value. Quoted literals and captures are UTF-8 strings; bare `true`/`false` and
+integer assignment literals are typed. `glob`, `lines`, and `words` create lists when
+assigned. Iterate with `for value in ${values}` or select with `${values[0]}`. Records
+continue to use `${record.field}`. Lists and records cannot be interpolated whole;
+select or iterate them. Scalar booleans and integers use canonical text spelling.
+
+An `if` containing a comparison or boolean operator, or beginning with `exists`, is a
+workflow expression. Equality is typed; ordering requires integers. `and`, `or`, `not`,
+and boolean variables are supported. `exists` resolves against the current workflow
+directory. There is no arithmetic, grouping, or general-purpose expression evaluation.
+Other conditions remain direct commands.
+
+Writes, appends, copy destinations, and redirection destinations create missing parent
+directories. `--check` parses only and performs no effects. Workflow commands accept
+the explicit stdin and environment forms documented above, while Rust callers can feed
+bytes with `Pipeline::stdin`. Invalid UTF-8 capture is an error, while uncaptured output
+bytes are forwarded without decoding.
+
+Typed behavior is experimental. Function defaults, same-path parallel-write detection,
+modules, arithmetic, command substitution, and shell compatibility remain deliberate
+limitations or future ideas.
+
+## Includes
+
+```shrimp
+include "lib/files.shrimp"
+call copy_if_present "input" "output"
+```
+
+`include VALUE` expands exactly one scalar path, reads UTF-8 Shrimp source, parses it,
+and executes its top-level statements in the current runtime. Functions and bindings
+therefore become available after the include; process and filesystem effects are not
+hidden. A path is resolved relative to the source file containing that include, not
+the process launch directory or a prior `cd` statement. Nested includes follow the
+same rule. Canonical files load once per workflow, cycles fail explicitly, and an
+included parse/runtime error names the included file and retains line diagnostics.
+Functions retain their defining source directory, so an include deferred inside a
+function follows the same relative-path rule. Parallel runtimes share include state:
+top-level effects execute once, while exported bindings and functions are copied into
+each branch that requests the already-loaded file.
+
+This is source composition, not a module/package system: it provides no namespace,
+export list, implicit search path, remote source, version selection, or isolation.
+
+## Potential future work
+
+These are design notes, not implemented syntax or commitments:
+
+| Idea | Possible shape | Difficulty | Main design issue |
+| --- | --- | --- | --- |
+| Command result records | `capture result <- unchecked $ tool`, then `result.success`, `result.code`, `result.stdout`, and `result.stderr` | Medium | Preserve the distinction between failure, status, raw bytes, and UTF-8 conversion without adding a broad byte type. |
+| Default function parameters | `fn package source destination="dist"` | Medium | Requires quote-aware signatures, trailing-default validation, and a firm rule for typed defaults; keyword arguments would remain out of scope. |
+| Parallel write collision checks | Reject two active branches claiming the same normalized destination | Medium–high | A shared registry can catch lexical matches, but symlinks and destinations that do not exist make perfect identity impractical. Dry-run must use the same checks. |
+| Recursive include checking | Have `--check` follow statically resolvable include files | Medium | Interpolated paths cannot always be resolved without evaluating bindings; literal paths can be checked safely without running effects. |
+| Namespaced modules | `import "release.shrimp" as release`, then `call release.publish ...` | High | Requires exports, qualified symbol tables, initialization and isolation rules, duplicate identity handling, and compatibility policy. `include` should remain sufficient until real workflows demonstrate this need. |
+| Windows process-tree cancellation | Put timed children in a Windows Job Object | High | This is platform process-management work and needs Windows integration coverage; direct-child termination is not production-grade tree management. |
+| Default process sandbox | Run sandboxed unless the runner receives an explicit `--no-sandbox` escape hatch | High | Filesystem path checks in the interpreter cannot contain directly executed tools. A real default must cover subprocess descendants and filesystem/network access through platform backends (for example Linux namespaces/seccomp, macOS sandbox facilities, and Windows restricted tokens/Job Objects), define toolchain mounts, and fail closed when unavailable. |
+
+Other explicit non-goals remain a shell-compatible parser, implicit shell execution,
+arithmetic/general expressions, package management, dependency graphs, caching, remote
+execution, and plugins.
+
+Shrimp does **not** currently claim to sandbox commands. They run directly with the
+runner's OS permissions and can access paths that language-level path validation cannot
+see. Adding a flag that guarded only Shrimp's built-in file statements would create a
+false security boundary, so the proposed default sandbox must be implemented at process
+level before the runner advertises it.

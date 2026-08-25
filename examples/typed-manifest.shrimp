@@ -1,0 +1,17 @@
+# Run with --dry-run first to print this workflow's execution plan.
+capture manifest <- cat workspace.tsv
+
+for line in lines "${manifest}"
+  record document tsv "${line}" fields name state source
+  if exists "${document.source}"
+    capture digest <- sha256sum "${document.source}"
+    append "generated/manifest-digests.txt" <- "${document.name}\t${digest}\n"
+  else
+    print "missing ${document.source}"
+  end
+end
+
+parallel
+  $ test -d "generated"
+  $ printf "%s\n" "manifest processed"
+end
