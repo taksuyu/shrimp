@@ -222,7 +222,7 @@ fn trace_redacts_secret_values() {
     let script = root.join("secret.shrimp");
     std::fs::write(
         &script,
-        "secret token = top-secret-value\n$ printf %s ${token}\n",
+        "secret token = top-secret-value\n$ cat <<< ${token}\n",
     )
     .unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_shrimp"))
@@ -511,4 +511,746 @@ fn worker_panic_is_not_reported_as_a_timeout() {
     let error = task.run(&Context::default()).unwrap_err();
     assert!(!matches!(error, Error::Timeout { .. }));
     assert!(error.to_string().contains("worker stopped"));
+}
+
+#[test]
+fn typed_values_compare_index_and_iterate_without_word_splitting() {
+    let root = sandbox("typed-values");
+    let source = r#"
+        let ready = true
+        let attempts = 4
+        let items = lines "alpha\ntwo words\ngamma"
+        if ready and attempts > 3
+          write "nested/result" <- "${items[1]}"
+        end
+        for item in ${items}
+          append "nested/all" <- "${item}\n"
+        end
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("nested/result")).unwrap(),
+        "two words"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("nested/all")).unwrap(),
+        "alpha\ntwo words\ngamma\n"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn structured_values_cannot_be_interpolated_ambiguously() {
+    let error = shrimp::Script::parse("let values = words \"a b\"\nprint \"${values}\"\n")
+        .unwrap()
+        .run(&Context::default())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("list cannot be interpolated"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("script line 2"), "{error}");
+}
+
+#[test]
+fn exists_and_integer_type_errors_are_explicit() {
+    let root = sandbox("typed-conditions");
+    std::fs::write(root.join("present"), "yes").unwrap();
+    shrimp::Script::parse("if exists \"present\"\n  write \"ok\" <- yes\nend\n")
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert!(root.join("ok").exists());
+    let error = shrimp::Script::parse("if name > 2\n  print no\nend\n")
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("ordered comparisons require integers"),
+        "{error}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn rust_pipeline_accepts_explicit_stdin_bytes() {
+    let output = cmd("cat")
+        .pipeline()
+        .stdin("from-memory")
+        .run(&Context::default())
+        .unwrap();
+    assert_eq!(output.stdout, b"from-memory");
+}
+
+#[test]
+fn includes_reusable_functions_relative_to_each_including_file_once() {
+    let root = sandbox("includes");
+    std::fs::create_dir_all(root.join("lib/nested")).unwrap();
+    std::fs::write(
+        root.join("lib/common.shrimp"),
+        "include \"nested/message.shrimp\"\nappend \"loaded\" <- x\nfn publish value\n  write \"result\" <- \"${prefix}:${value}\"\nend\n",
+    ).unwrap();
+    std::fs::write(
+        root.join("lib/nested/message.shrimp"),
+        "let prefix = reusable\n",
+    )
+    .unwrap();
+    let script = shrimp::Script::parse(
+        "include \"lib/common.shrimp\"\ninclude \"lib/common.shrimp\"\ncall publish artifact\n",
+    )
+    .unwrap();
+    script.run(&Context::new(&root)).unwrap();
+    assert_eq!(std::fs::read_to_string(root.join("loaded")).unwrap(), "x");
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "reusable:artifact"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn include_exports_assignments_even_when_first_caller_had_the_same_value() {
+    let root = sandbox("include-same-value-export");
+    std::fs::write(root.join("bindings.shrimp"), "let shared = same\n").unwrap();
+    let script = shrimp::Script::parse(
+        "fn prime\n  let shared = same\n  include \"bindings.shrimp\"\nend\ncall prime\ninclude \"bindings.shrimp\"\nwrite \"result\" <- \"${shared}\"\n",
+    )
+    .unwrap();
+    script.run(&Context::new(&root)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "same"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn include_cycles_report_the_file_and_call_site() {
+    let root = sandbox("include-cycle");
+    std::fs::write(root.join("a.shrimp"), "include \"b.shrimp\"\n").unwrap();
+    std::fs::write(root.join("b.shrimp"), "include \"a.shrimp\"\n").unwrap();
+    let error = shrimp::Script::parse("include \"a.shrimp\"\n")
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("include cycle detected"), "{message}");
+    assert!(message.contains("a.shrimp"), "{message}");
+    assert!(message.contains("script line 1"), "{message}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn functions_implicitly_return_their_last_typed_value() {
+    let root = sandbox("function-values");
+    let source = r#"
+        fn identity input
+          value ${input}
+        end
+        fn attempts
+          let count = 4
+        end
+        let original = lines "one\ntwo words"
+        call returned <- identity ${original}
+        call count <- attempts
+        if count == 4
+          write "result" <- "${returned[1]}"
+        end
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "two words"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn script_commands_accept_file_and_value_stdin_and_environment_overrides() {
+    let root = sandbox("command-input-env");
+    std::fs::write(root.join("input"), "from-file").unwrap();
+    let source = r#"
+        $ sh -c "cat > file-result" < "input"
+        $ cat < "input" > "combined-result"
+        let input = "from-value"
+        env OUTPUT=value-result $ sh -c "cat > \"$OUTPUT\"" <<< "${input}"
+        $ sh -c "printf ignored; printf diagnostic >&2" > discard
+        $ sh -c "printf visible; printf ignored >&2" 2> discard
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("file-result")).unwrap(),
+        "from-file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("value-result")).unwrap(),
+        "from-value"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("combined-result")).unwrap(),
+        "from-file"
+    );
+    assert!(!root.join("discard").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn single_quoted_backslashes_are_literal_during_delimiter_scanning() {
+    let root = sandbox("single-quoted-backslashes");
+    let source = r#"
+        write "trailing" <- 'a\'
+        write "windows" <- 'C:\dir\'
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("trailing")).unwrap(),
+        "a\\"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("windows")).unwrap(),
+        "C:\\dir\\"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn temporary_paths_are_unique_typed_and_cleaned_after_execution() {
+    let root = sandbox("temporary-paths");
+    let source = r#"
+        temp_file scratch
+        write "temp-path" <- "${scratch}"
+        temp_dir staging
+        write "${staging}/nested/value" <- ok
+        write "dir-path" <- "${staging}"
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    let file = std::fs::read_to_string(root.join("temp-path")).unwrap();
+    let directory = std::fs::read_to_string(root.join("dir-path")).unwrap();
+    assert_ne!(file, directory);
+    assert!(!std::path::Path::new(&file).exists());
+    assert!(!std::path::Path::new(&directory).exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn temporary_paths_are_cleaned_when_the_workflow_fails() {
+    let root = sandbox("temporary-error-cleanup");
+    let workflow = shrimp::Script::parse(
+        "temp_dir staging\nwrite \"remembered\" <- \"${staging}\"\n$ shrimp-command-that-does-not-exist\n",
+    ).unwrap();
+    assert!(workflow.run(&Context::new(&root)).is_err());
+    let path = std::fs::read_to_string(root.join("remembered")).unwrap();
+    assert!(!std::path::Path::new(&path).exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn file_metadata_produces_integer_values() {
+    let root = sandbox("metadata");
+    std::fs::write(root.join("artifact"), "12345").unwrap();
+    let source = r#"
+        file_size bytes <- "artifact"
+        modified_time changed <- "artifact"
+        if bytes == 5 and changed > 0
+          write "result" <- "${bytes}"
+        end
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(root.join("result")).unwrap(), "5");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dry_run_metadata_does_not_read_files_suppressed_by_dry_run() {
+    let root = sandbox("dry-run-metadata");
+    let script = shrimp::Script::parse(
+        "write \"future/file\" <- contents\nfile_size bytes <- \"future/file\"\nmodified_time changed <- \"future/file\"\n",
+    )
+    .unwrap();
+    script
+        .run_with_options(
+            &Context::new(&root),
+            shrimp::ScriptOptions {
+                dry_run: true,
+                trace: false,
+            },
+        )
+        .unwrap();
+    assert!(!root.join("future").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_conditions_preserve_quotes_whitespace_and_nested_lookup() {
+    let root = sandbox("condition-token-metadata");
+    let source = r#"
+        let ready = true
+        let name = "two words"
+        record row tsv "10" fields size
+        if "4" != 4 and "true" != true and name == "two words" and row.size == "10" and ready
+          write "result" <- correct
+        else
+          write "result" <- wrong
+        end
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "correct"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn command_conditions_ignore_quoted_operators_and_output_redirects() {
+    let root = sandbox("command-condition-classification");
+    let source = r#"
+        if printf "a and b"
+          write "quoted" <- yes
+        end
+        if sh -c "exit 0" > "condition-output"
+          write "redirected" <- yes
+        end
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert!(root.join("quoted").exists());
+    assert!(root.join("redirected").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn functions_retain_their_include_directory_for_deferred_includes() {
+    let root = sandbox("deferred-include-directory");
+    std::fs::create_dir_all(root.join("lib/nested")).unwrap();
+    std::fs::write(
+        root.join("lib/functions.shrimp"),
+        "fn load\n  include \"nested/value.shrimp\"\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("lib/nested/value.shrimp"),
+        "write \"loaded\" <- yes\n",
+    )
+    .unwrap();
+    shrimp::Script::parse("include \"lib/functions.shrimp\"\ncall load\n")
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(root.join("loaded")).unwrap(), "yes");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn parallel_branches_share_include_once_state() {
+    let root = sandbox("parallel-include-once");
+    std::fs::write(
+        root.join("setup.shrimp"),
+        "append \"loaded\" <- x\nlet prefix = shared\nfn mark name\n  write \"${prefix}-${name}\" <- yes\nend\n",
+    )
+    .unwrap();
+    shrimp::Script::parse(
+        "parallel for item in words \"left right\" limit 2\n  include \"setup.shrimp\"\n  call mark \"${item}\"\nend\n",
+    )
+    .unwrap()
+    .run(&Context::new(&root))
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(root.join("loaded")).unwrap(), "x");
+    assert!(root.join("shared-left").exists());
+    assert!(root.join("shared-right").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn malformed_double_less_than_redirection_is_rejected() {
+    let error = shrimp::Script::parse("$ tool << input\n")
+        .unwrap()
+        .run(&Context::default())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("`< FILE` or `<<< VALUE`"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("script line 1"), "{error}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_temporary_paths_have_private_permissions() {
+    let root = sandbox("temporary-permissions");
+    let workflow = shrimp::Script::parse(
+        "temp_file file\ntemp_dir directory\n$ sh -c \"stat -c %a $1 > file-mode\" _ \"${file}\"\n$ sh -c \"stat -c %a $1 > dir-mode\" _ \"${directory}\"\n",
+    ).unwrap();
+    workflow.run(&Context::new(&root)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("file-mode")).unwrap(),
+        "600\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("dir-mode")).unwrap(),
+        "700\n"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn quoted_call_delimiters_are_arguments_not_assignment_operators() {
+    let root = sandbox("quoted-call-delimiter");
+    let source = r#"
+        fn notify message
+          value ${message}
+        end
+        call notify "a <- b"
+        call result <- notify "c <- d"
+        write "result" <- "${result}"
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "c <- d"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn configurable_delimiter_scanner_ignores_delimiters_inside_values() {
+    let root = sandbox("configurable-delimiters");
+    let source = r#"
+        record row tsv "a fields b" fields text
+        for item in lines "x in y"
+          write "result" <- "${row.text}:${item}"
+        end
+    "#;
+    shrimp::Script::parse(source)
+        .unwrap()
+        .run(&Context::new(&root))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "a fields b:x in y"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn comment_delimiter_stops_quote_scanning_for_ignored_text() {
+    shrimp::Script::parse("# author's ignored apostrophe\nlet value = ok\n").unwrap();
+}
+
+#[test]
+fn included_parallel_workers_can_load_new_nested_includes() {
+    let root = sandbox("nested-parallel-includes");
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(
+        root.join("lib/root.shrimp"),
+        "parallel\n  include \"left.shrimp\"\n  include \"right.shrimp\"\nend\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("lib/left.shrimp"), "write \"left\" <- yes\n").unwrap();
+    std::fs::write(root.join("lib/right.shrimp"), "write \"right\" <- yes\n").unwrap();
+    let script = shrimp::Script::parse("include \"lib/root.shrimp\"\n").unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let context = Context::new(&root);
+    std::thread::spawn(move || sender.send(script.run(&context)).unwrap());
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("nested parallel includes deadlocked")
+        .unwrap();
+    assert!(root.join("left").exists());
+    assert!(root.join("right").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cross_thread_include_cycles_fail_instead_of_deadlocking() {
+    let root = sandbox("parallel-include-cycle");
+    std::fs::write(root.join("left.shrimp"), "include \"right.shrimp\"\n").unwrap();
+    std::fs::write(root.join("right.shrimp"), "include \"left.shrimp\"\n").unwrap();
+    let script = shrimp::Script::parse(
+        "parallel\n  include \"left.shrimp\"\n  include \"right.shrimp\"\nend\n",
+    )
+    .unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let context = Context::new(&root);
+    std::thread::spawn(move || sender.send(script.run(&context)).unwrap());
+    let error = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("parallel include cycle deadlocked")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("include cycle detected"),
+        "{error}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn parallel_include_lineage_reentry_fails_instead_of_deadlocking() {
+    let root = sandbox("parallel-include-lineage");
+    std::fs::write(
+        root.join("root.shrimp"),
+        "parallel\n  include \"root.shrimp\"\nend\n",
+    )
+    .unwrap();
+    let script = shrimp::Script::parse("include \"root.shrimp\"\n").unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let context = Context::new(&root);
+    std::thread::spawn(move || sender.send(script.run(&context)).unwrap());
+    let error = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("parallel include lineage re-entry deadlocked")
+        .unwrap_err();
+    assert!(error.to_string().contains("include cycle detected"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn early_stdin_close_is_treated_as_broken_pipe_not_failure() {
+    cmd("true")
+        .pipeline()
+        .stdin(vec![b'x'; 1024 * 1024])
+        .run(&Context::default())
+        .unwrap();
+    cmd("true")
+        .pipeline()
+        .stdin(vec![b'x'; 1024 * 1024])
+        .run_timeout(&Context::default(), Duration::from_secs(1))
+        .unwrap();
+}
+
+#[test]
+fn workflow_arguments_must_be_declared_explicitly() {
+    let root = sandbox("explicit-arguments");
+    let script =
+        shrimp::Script::parse("arg PROFILE\nwrite \"result\" <- \"${PROFILE}\"\n").unwrap();
+    script
+        .run(&Context::new(&root).with_argument("PROFILE", "release"))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "release"
+    );
+
+    let error = script.run(&Context::new(&root)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("required workflow argument `PROFILE`")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn secret_workflow_arguments_are_rejected_before_execution() {
+    let error = shrimp::Script::parse("secret arg API_TOKEN\n").unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("script line 1"), "{message}");
+    assert!(
+        message.contains("command-line arguments are visible"),
+        "{message}"
+    );
+    assert!(message.contains("secret env NAME"), "{message}");
+}
+
+#[test]
+fn with_cwd_is_scoped_while_cd_is_persistent() {
+    let root = sandbox("scoped-cwd");
+    std::fs::create_dir_all(root.join("one/two")).unwrap();
+    let script = shrimp::Script::parse(
+        "with cwd \"one\"\n  write \"scoped\" <- yes\n  with cwd \"two\"\n    write \"nested\" <- yes\n  end\nend\nwrite \"root\" <- yes\ncd \"one\"\nwrite \"persistent\" <- yes\n",
+    )
+    .unwrap();
+    script.run(&Context::new(&root)).unwrap();
+    assert!(root.join("one/scoped").exists());
+    assert!(root.join("one/two/nested").exists());
+    assert!(root.join("root").exists());
+    assert!(root.join("one/persistent").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn undeclared_context_values_are_not_workflow_variables() {
+    let script = shrimp::Script::parse("print \"${UNDECLARED}\"\n").unwrap();
+    let error = script
+        .run(&Context::default().with_argument("UNDECLARED", "hidden"))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("undefined variable `UNDECLARED`")
+    );
+}
+
+#[test]
+fn missing_explicit_environment_inputs_are_line_aware() {
+    let name = format!("SHRIMP_TEST_MISSING_ENV_{}", std::process::id());
+    let script = shrimp::Script::parse(&format!("env {name}\n")).unwrap();
+    let error = script.run(&Context::default()).unwrap_err();
+    assert!(error.to_string().contains("script line 1"));
+    assert!(error.to_string().contains("required environment variable"));
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_logs_declared_inputs_and_redacts_secret_environment_values() {
+    let root = sandbox("input-trace");
+    let script = root.join("inputs.shrimp");
+    std::fs::write(
+        &script,
+        "arg PROFILE\nsecret env SHRIMP_TRACE_TOKEN\nenv SHRIMP_TRACE_TOKEN=\"${SHRIMP_TRACE_TOKEN}\" $ sh -c 'printf %s \"$SHRIMP_TRACE_TOKEN\"'\n$ printf %s ${PROFILE}\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_shrimp"))
+        .args(["--trace", script.to_str().unwrap(), "PROFILE=release"])
+        .env("SHRIMP_TRACE_TOKEN", "private-token")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let trace = String::from_utf8(output.stderr).unwrap();
+    assert!(trace.contains("use arg PROFILE"), "{trace}");
+    assert!(trace.contains("use env SHRIMP_TRACE_TOKEN"), "{trace}");
+    assert!(trace.contains("[REDACTED]"), "{trace}");
+    assert!(!trace.contains("private-token"), "{trace}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_values_are_rejected_in_argv_but_allowed_in_env_and_stdin() {
+    let root = sandbox("secret-command-channels");
+    let context = Context::new(&root).with_env("SHRIMP_SECRET_INPUT", "private-value");
+
+    for source in [
+        "secret env SHRIMP_SECRET_INPUT\n$ printf %s ${SHRIMP_SECRET_INPUT}\n",
+        "secret token = private-value\n$ printf %s ${token}\n",
+    ] {
+        let error = shrimp::Script::parse(source)
+            .unwrap()
+            .run(&context)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be used as command arguments")
+        );
+    }
+
+    let allowed = shrimp::Script::parse(
+        "secret env SHRIMP_SECRET_INPUT\nenv TOKEN=\"${SHRIMP_SECRET_INPUT}\" $ sh -c 'printf %s \"$TOKEN\"' > \"env-result\"\n$ cat <<< \"${SHRIMP_SECRET_INPUT}\" > \"stdin-result\"\n$ printf %s ordinary > \"ordinary-result\"\n",
+    )
+    .unwrap();
+    allowed.run(&context).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("env-result")).unwrap(),
+        "private-value"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("stdin-result")).unwrap(),
+        "private-value"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("ordinary-result")).unwrap(),
+        "ordinary"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_provenance_survives_alias_parameters_and_function_results() {
+    let context = Context::default();
+    let cases = [
+        "secret source = distinctive-secret\nlet alias = ${source}\n$ printf %s ${alias}\n",
+        "fn consume input\n  $ printf %s ${input}\nend\nsecret source = distinctive-secret\ncall consume ${source}\n",
+        "fn identity input\n  value ${input}\nend\nsecret source = distinctive-secret\ncall result <- identity ${source}\n$ printf %s ${result}\n",
+    ];
+    for source in cases {
+        let error = shrimp::Script::parse(source)
+            .unwrap()
+            .run(&context)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be used as command arguments"),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_redacts_secret_list_and_record_leaves() {
+    let root = sandbox("structured-secret-trace");
+    let script = root.join("structured-secrets.shrimp");
+    std::fs::write(
+        &script,
+        "secret items = words \"list-secret other-secret\"\nrecord source tsv \"record-secret\" fields token\nsecret row = ${source}\nprint \"${items[0]}:${row.token}\"\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_shrimp"))
+        .args(["--trace", script.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let trace = String::from_utf8(output.stderr).unwrap();
+    assert!(!trace.contains("list-secret"), "{trace}");
+    assert!(!trace.contains("record-secret"), "{trace}");
+    assert!(trace.matches("[REDACTED]").count() >= 2, "{trace}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_does_not_redact_low_entropy_typed_secrets_or_integer_substrings() {
+    let root = sandbox("typed-secret-redaction-boundaries");
+    let script = root.join("typed-secrets.shrimp");
+    std::fs::write(
+        &script,
+        "secret flag = true\nsecret small = 12\nsecret distinctive = 1234\nprint \"flag=${flag} small=${small} exact=${distinctive} larger=912345\"\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_shrimp"))
+        .args(["--trace", script.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let trace = String::from_utf8(output.stderr).unwrap();
+    assert!(trace.contains("flag=true"), "{trace}");
+    assert!(trace.contains("small=12"), "{trace}");
+    assert!(trace.contains("exact=[REDACTED]"), "{trace}");
+    assert!(trace.contains("larger=912345"), "{trace}");
+    std::fs::remove_dir_all(root).unwrap();
 }

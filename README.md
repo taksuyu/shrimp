@@ -56,8 +56,27 @@ $ cargo build --profile "${profile}"
 print "built ${revision}"
 ```
 
-Captured output has trailing newlines removed. Variables supplied on the command line
-are available to interpolation and child processes:
+Captured output has trailing newlines removed. External inputs must be declared before
+use, making the workflow's interface visible at the top of the file:
+
+```shrimp
+arg ENV
+arg VERSION
+env HOME
+secret env DEPLOY_TOKEN
+```
+
+`arg NAME` is satisfied by a `NAME=VALUE` runner argument. `env NAME` explicitly imports
+one ambient process environment variable. `secret env NAME` also redacts its value from
+traces and diagnostics. Values that were supplied but never declared are unavailable to
+interpolation. Child processes still inherit the runner environment in the ordinary OS
+way; declarations control workflow values, not process inheritance.
+
+Shrimp deliberately rejects `secret arg NAME`: command-line values can be exposed by
+shell history and local process inspection before Shrimp can redact them. Pass
+confidential inputs through `secret env NAME` instead. Environment variables are not a
+universal secret store, but they avoid placing the value directly in Shrimp's argv;
+production workflows should use their platform's credential injection facilities.
 
 ```console
 shrimp deploy.shrimp ENV=staging VERSION=1.2.3
@@ -75,11 +94,16 @@ append "target/package/log" <- "built ${revision}\n"
 copy "assets/config.json" -> "target/package/config.json"
 remove "target/package/obsolete.txt"
 cd "subproject"
+with cwd "nested-project"
+  $ cargo build
+end
 ```
 
 `write` uses a same-directory temporary file and rename, so readers never observe a
 partially written result. Paths are relative to the script directory, not whichever
 directory happened to launch Shrimp.
+`cd` persists in the current branch; `with cwd PATH ... end` restores the previous
+command/filesystem context after its block. Include resolution remains source-relative.
 
 ### Conditions and retries
 
@@ -126,12 +150,17 @@ and process side effects are shared.
 ```shrimp
 $ cargo metadata > "target/metadata.json"
 $ diagnostics 2> "target/diagnostics.log"
-secret token = "${DEPLOY_TOKEN}"
-$ deploy --token "${token}"
+secret env DEPLOY_TOKEN
+env DEPLOY_TOKEN="${DEPLOY_TOKEN}" $ deploy
 ```
 
 `>`, `>>`, and `2>` redirect final process output. `--trace` prints expanded actions;
-values declared with `secret` are replaced by `[REDACTED]` in traces. `--dry-run`
+values declared with `secret` are replaced by `[REDACTED]` in traces. With `--trace`,
+Shrimp logs each declared argument/environment input by name and safely expanded commands.
+Secret workflow values cannot be interpolated into a program or command argument because
+argv is observable outside Shrimp. Pass them through an explicit per-command environment
+override as above, or through explicit stdin. Ordinary non-secret arguments are unchanged.
+`--dry-run`
 prints the plan without launching commands or changing files.
 
 ### Comments and continuation
@@ -171,12 +200,21 @@ Implemented now:
 - stdout/stderr redirection and cancellable command timeouts;
 - secret-aware tracing and side-effect-free dry runs;
 - TSV records with named field access and string `match` branches;
-- recursive workspace removal and concurrency-bounded parallel loops.
+- recursive workspace removal and concurrency-bounded parallel loops;
+- typed values, typed conditions, list indexing, and typed function results;
+- explicit file/value stdin and per-command environment overrides;
+- managed temporary paths and integer file metadata;
+- explicit required workflow arguments and ambient-environment imports.
 
 The initial language contract is documented in [`docs/language.md`](docs/language.md).
-Remaining production-hardening work includes Windows job-object cancellation, richer
-typed values beyond TSV records, explicit stdin redirection, file durability policy,
-and a compatibility/versioning policy once the syntax has had real-world use.
+Remaining production-hardening work includes Windows job-object cancellation, parallel
+write collision checks, file durability policy, and a compatibility/versioning policy
+once the syntax has had real-world use.
+
+Commands currently run with the runner's OS permissions. A default-on subprocess
+sandbox with an explicit `--no-sandbox` escape hatch is documented as high-difficulty
+future work. Interpreter-only path checks are intentionally not presented as a security
+sandbox because directly invoked tools could bypass them.
 
 ## Rust embedding API
 
@@ -196,3 +234,63 @@ For a more demanding side-by-side exercise, the
 [`examples/workspace-comparison`](examples/workspace-comparison/README.md) benchmark
 implements the same document-driven workspace build in Bash, Nushell, and Shrimp and
 uses a Makefile to compare their outputs and repeatability.
+
+## Typed workflow additions
+
+Shrimp's deliberately small value model contains strings, booleans, signed integers,
+lists, records, and an internal missing value. Bare `true`, `false`, and integer
+assignments are typed. `glob`, `lines`, and `words` produce lists when assigned; lists
+can be iterated (`for item in ${items}`) or indexed (`${items[0]}`). Records use named
+access (`${document.path}`). A whole list or record cannot be interpolated, avoiding
+an implicit joining or serialization convention.
+
+Workflow conditions support typed `==` and `!=`, integer `<`, `<=`, `>`, and `>=`,
+`and`, `or`, `not`, boolean variables, and `exists PATH`. Conditions without these
+markers remain direct command-status checks. Shrimp intentionally has no arithmetic or
+arbitrary expression evaluator.
+
+Writes, appends, copies, and redirection destinations create missing parents. The
+`--check` runner option parses without executing. Rust embedders may feed bytes directly
+to the first pipeline process with `Pipeline::stdin`.
+
+Still deliberately absent are function defaults, parallel same-path write detection,
+namespaced modules, and shell compatibility. These typed additions remain experimental
+and do not constitute a compatibility promise. The selected workflow additions stay small:
+
+```shrimp
+fn artifact_path name
+  value "target/${name}.tar.gz"
+end
+call artifact <- artifact_path "release"
+
+$ tool < "input.txt"
+$ tool <<< "${captured}" > "output.txt"
+env PROFILE="release" $ cargo build
+
+temp_file scratch
+temp_dir staging
+file_size bytes <- "output.txt"
+modified_time changed_at <- "output.txt"
+```
+
+Functions implicitly return their final statement value and accept typed arguments;
+there is no early-return control flow. Temporary paths are cleaned up when the workflow
+ends; names use OS randomness and exclusive creation retries collisions. Metadata values
+are integers. See the language reference for exact semantics and
+for a difficulty-ranked list of potential future work.
+
+## Reusable workflow files
+
+`include` is a deliberately smaller feature than a module system:
+
+```shrimp
+include "lib/release.shrimp"
+call publish "target/package.tar.gz"
+```
+
+An included UTF-8 file is parsed and executed directly, so its function definitions
+and top-level bindings become available to the caller and its explicit effects remain
+visible. Paths are relative to the file containing the `include`, nested includes work
+the same way, and each canonical file is loaded once per workflow. Include cycles and
+errors in included files name the relevant file. There are no namespaces, implicit
+search paths, remote imports, package resolution, or compatibility/version metadata.

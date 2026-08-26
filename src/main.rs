@@ -11,9 +11,20 @@ fn main() -> ExitCode {
     }
 }
 
+/// Runs the Shrimp command-line workflow with the selected execution options.
+///
+/// Supports syntax checking, dry runs, tracing, help output, process environment
+/// variables, and explicit `NAME=VALUE` workflow arguments.
+///
+/// # Examples
+///
+/// ```text
+/// shrimp --check workflow.shrimp
+/// ```
 fn run() -> shrimp::Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
     let mut options = ScriptOptions::default();
+    let mut check = false;
     while let Some(argument) = args.peek() {
         if argument == "--dry-run" {
             options.dry_run = true;
@@ -21,18 +32,23 @@ fn run() -> shrimp::Result<()> {
         } else if argument == "--trace" {
             options.trace = true;
             args.next();
+        } else if argument == "--check" {
+            check = true;
+            args.next();
         } else {
             break;
         }
     }
     let Some(path) = args.next() else {
         eprintln!(
-            "Usage: shrimp [--dry-run] [--trace] <workflow.shrimp> [NAME=VALUE ...]\n\nRun a portable Shrimp workflow. Extra NAME=VALUE arguments become variables."
+            "Usage: shrimp [--check] [--dry-run] [--trace] <workflow.shrimp> [NAME=VALUE ...]\n\nRun a portable Shrimp workflow. Extra NAME=VALUE arguments satisfy explicit `arg NAME` declarations."
         );
         return Err(shrimp::Error::message("missing script path"));
     };
     if path == "--help" || path == "-h" {
-        println!("Usage: shrimp [--dry-run] [--trace] <workflow.shrimp> [NAME=VALUE ...]");
+        println!(
+            "Usage: shrimp [--check] [--dry-run] [--trace] <workflow.shrimp> [NAME=VALUE ...]"
+        );
         return Ok(());
     }
     let path = PathBuf::from(path);
@@ -44,14 +60,21 @@ fn run() -> shrimp::Result<()> {
         std::fs::canonicalize(cwd)
             .map_err(|e| shrimp::Error::message(format!("resolve script directory: {e}")))?,
     );
+    for (name, value) in std::env::vars_os() {
+        context = context.with_env(name, value);
+    }
     for argument in args {
         let argument = argument.to_string_lossy();
         let (name, value) = argument.split_once('=').ok_or_else(|| {
             shrimp::Error::message(format!("expected NAME=VALUE, got `{argument}`"))
         })?;
-        context = context.with_env(name, value);
+        context = context.with_argument(name, value);
     }
     let script = Script::from_file(&path)?;
+    if check {
+        eprintln!("shrimp: syntax OK");
+        return Ok(());
+    }
     let report = script.run_with_options(&context, options)?;
     eprintln!(
         "shrimp: completed ({} commands, {} file changes)",
