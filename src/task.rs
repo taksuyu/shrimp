@@ -111,9 +111,11 @@ impl Context {
     ///
     /// # Examples
     ///
-    /// ```text
-    /// let context = Context::new().with_cwd("/tmp/workflow");
-    /// assert_eq!(context.cwd, std::path::PathBuf::from("/tmp/workflow"));
+    /// ```
+    /// use shrimp::Context;
+    ///
+    /// let context = Context::default().with_cwd("/tmp/workflow");
+    /// assert_eq!(context.cwd(), std::path::Path::new("/tmp/workflow"));
     /// ```
     pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = cwd.into();

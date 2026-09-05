@@ -322,6 +322,7 @@ impl Script {
             last_value: Value::Missing,
             last_value_secret: false,
             assigned_variables: Vec::new(),
+            defined_functions: Vec::new(),
             temporary_paths: Arc::new(Mutex::new(Vec::new())),
         };
         let result = runtime
@@ -350,6 +351,8 @@ struct Runtime {
     last_value: Value,
     last_value_secret: bool,
     assigned_variables: Vec<String>,
+    // Branch-local. Include caching uses definition events instead of map-key differences.
+    defined_functions: Vec<String>,
     temporary_paths: Arc<Mutex<Vec<PathBuf>>>,
 }
 
@@ -756,6 +759,7 @@ impl Runtime {
                 parameters,
                 body,
             } => {
+                self.defined_functions.push(name.clone());
                 self.functions.insert(
                     name.clone(),
                     FunctionDefinition {
@@ -1284,8 +1288,7 @@ impl Runtime {
             break;
         }
         let assignments_before = self.assigned_variables.len();
-        let functions_before = self.functions.clone();
-        let secrets_before = self.secrets.clone();
+        let functions_before = self.defined_functions.len();
         self.include_chain.push(path.clone());
         let result = (|| {
             let source = std::fs::read_to_string(&path)
@@ -1317,13 +1320,22 @@ impl Runtime {
                         .map(|value| (name.clone(), value.clone()))
                 })
                 .collect();
-            let functions = self
-                .functions
+            let defined: HashSet<_> = self.defined_functions[functions_before..]
                 .iter()
-                .filter(|(name, _)| !functions_before.contains_key(*name))
-                .map(|(name, value)| (name.clone(), value.clone()))
+                .cloned()
                 .collect();
-            let secrets = self.secrets.difference(&secrets_before).cloned().collect();
+            let functions = defined
+                .iter()
+                .filter_map(|name| {
+                    self.functions
+                        .get(name)
+                        .map(|value| (name.clone(), value.clone()))
+                })
+                .collect();
+            let secrets = assigned
+                .into_iter()
+                .filter(|name| self.secrets.contains(name))
+                .collect();
             registry.loaded.insert(
                 path,
                 IncludeExports {
@@ -2721,7 +2733,10 @@ fn extract_input(line: &str) -> Result<(&str, Option<(bool, &str)>)> {
         .into_iter()
         .find(|found| found.delimiter != "<-");
     if let Some(found) = found {
-        if found.delimiter == "<<" {
+        let immediately_followed_by_less_than = line
+            .get(found.index + found.delimiter.len()..)
+            .is_some_and(|remainder| remainder.starts_with('<'));
+        if found.delimiter == "<<" || immediately_followed_by_less_than {
             return Err(Error::message(
                 "stdin redirection syntax: `< FILE` or `<<< VALUE`",
             ));
