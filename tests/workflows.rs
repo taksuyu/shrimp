@@ -631,6 +631,45 @@ fn include_exports_assignments_even_when_first_caller_had_the_same_value() {
 }
 
 #[test]
+fn cached_include_exports_replaced_functions() {
+    let root = sandbox("include-function-replacement");
+    std::fs::write(
+        root.join("functions.shrimp"),
+        "fn render\n  value new\nend\n",
+    )
+    .unwrap();
+    let script = shrimp::Script::parse(
+        "fn render\n  value old\nend\nfn prime\n  include \"functions.shrimp\"\nend\ncall prime\nfn render\n  value stale\nend\ninclude \"functions.shrimp\"\ncall result <- render\nwrite \"result\" <- \"${result}\"\n",
+    )
+    .unwrap();
+    script.run(&Context::new(&root)).unwrap();
+    assert_eq!(std::fs::read_to_string(root.join("result")).unwrap(), "new");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cached_include_preserves_secret_status_for_reassigned_names() {
+    let root = sandbox("include-secret-reassignment");
+    std::fs::write(root.join("secret.shrimp"), "secret token = private\n").unwrap();
+    let script = shrimp::Script::parse(
+        "secret token = original\nfn prime\n  include \"secret.shrimp\"\nend\ncall prime\nlet token = public\ninclude \"secret.shrimp\"\n$ echo ${token}\n",
+    )
+    .unwrap();
+    let error = script.run(&Context::new(&root)).unwrap_err().to_string();
+    assert!(error.contains("secret"), "{error}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rejects_overlong_stdin_redirection_delimiters() {
+    let error = shrimp::Script::parse("$ tool <<<<payload\n")
+        .unwrap()
+        .run(&Context::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("stdin redirection syntax"));
+}
+
+#[test]
 fn include_cycles_report_the_file_and_call_site() {
     let root = sandbox("include-cycle");
     std::fs::write(root.join("a.shrimp"), "include \"b.shrimp\"\n").unwrap();
@@ -989,6 +1028,45 @@ fn included_parallel_workers_can_load_new_nested_includes() {
         .unwrap();
     assert!(root.join("left").exists());
     assert!(root.join("right").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn cached_outer_include_reexports_functions_from_cached_nested_include() {
+    let root = sandbox("nested-cached-function-exports");
+    std::fs::write(
+        root.join("inner.shrimp"),
+        "fn nested\n  value available\nend\nwrite \"inner-ready\" <- yes\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("outer.shrimp"), "include \"inner.shrimp\"\n").unwrap();
+    let script = shrimp::Script::parse(
+        r#"
+          fn prime_inner
+            include "inner.shrimp"
+          end
+          fn cache_outer
+            $ sh -c "while [ ! -f inner-ready ]; do sleep .01; done"
+            include "outer.shrimp"
+          end
+          parallel
+            call prime_inner
+            call cache_outer
+          end
+          include "outer.shrimp"
+          call result <- nested
+          write "result" <- "${result}"
+        "#,
+    )
+    .unwrap();
+
+    script.run(&Context::new(&root)).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "available"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
