@@ -1257,11 +1257,13 @@ impl Runtime {
             let mut registry = lock.lock().expect("include registry poisoned");
             if let Some(exports) = registry.loaded.get(&path).cloned() {
                 drop(registry);
+                let function_names = exports.functions.keys().cloned().collect::<Vec<_>>();
                 for (name, value) in exports.variables {
                     let secret = exports.secrets.contains(&name);
                     self.bind(name, value, secret);
                 }
                 self.functions.extend(exports.functions);
+                self.defined_functions.extend(function_names);
                 self.secrets.extend(exports.secrets);
                 return Ok(());
             }

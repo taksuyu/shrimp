@@ -7,7 +7,7 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
 | ID | Category | Count | Last seen | Prevention rule |
 | --- | --- | ---: | --- | --- |
 | PARSE-001 | Lossy syntax handling discarded quote/token boundaries | 9 | PR #5, 2026-08-24 | Preserve raw token spans or quote metadata through classification and evaluation. Route all language delimiters through the shared scanner. Keep quote and escape semantics identical across scanning and tokenization, and test quoted, escaped, nested, adjacent, and malformed forms. |
-| STATE-001 | Deferred/parallel execution lost required shared or lexical context | 6 | PR #6 follow-up, 2026-08-26 | Classify cloned runtime state as local vs shared. Preserve logical ancestry and explicit assignment events across clones/caches, model waits and joins, and test nested deferred execution for deadlocks and caller-independent results. |
+| STATE-001 | Deferred/parallel execution lost required shared or lexical context | 7 | PR #7, 2026-09-05 | Classify cloned runtime state as local vs shared. Preserve logical ancestry and explicit assignment events across clones/caches, model waits and joins, and test nested deferred execution for deadlocks and caller-independent results. |
 | SAFE-001 | Data crossed a trust or privacy boundary without validation | 9 | PR #6 follow-up, 2026-08-26 | Treat workflow-derived paths and confidential inputs as untrusted. Preserve secret provenance across every binding path, prevent secrets from entering argv, redact structured leaves only when sufficiently distinctive, and test collisions, cleanup, over-redaction, and exposure boundaries. |
 | PORT-001 | A cross-platform test assumed a Unix utility | 1 | PR #3 | Use a portable test helper or gate utility-dependent tests with the appropriate target configuration. |
 | PARSE-002 | Malformed near-miss syntax was accepted as a different construct | 2 | PR #6 follow-up, 2026-08-26 | For every new delimiter, test missing, doubled, truncated, quoted, and adjacent forms; reject unsupported forms at parse time. |
@@ -37,7 +37,7 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
 8. Function calls used raw whitespace splitting for the function-name boundary.
 9. Structured lookup used raw split/find passes for record and list delimiters.
 
-### STATE-001 — 6
+### STATE-001 — 7
 
 1. A function defined in an included file did not retain that file's directory for an
    `include` executed later from the function body.
@@ -51,6 +51,8 @@ set is [PR #3](https://github.com/taksuyu/shrimp/pull/3), reviewed 2026-08-17.
    on the first caller's pre-existing values.
 6. Include exports inferred functions from new map keys, so cached redefinitions depended
    on which parallel caller loaded the file.
+7. Replaying a cached nested include restored functions without recording definition
+   events, so a cached outer include could omit those function exports.
 
 ### DESIGN-001 — 2
 

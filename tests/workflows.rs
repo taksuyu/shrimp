@@ -1031,6 +1031,45 @@ fn included_parallel_workers_can_load_new_nested_includes() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn cached_outer_include_reexports_functions_from_cached_nested_include() {
+    let root = sandbox("nested-cached-function-exports");
+    std::fs::write(
+        root.join("inner.shrimp"),
+        "fn nested\n  value available\nend\nwrite \"inner-ready\" <- yes\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("outer.shrimp"), "include \"inner.shrimp\"\n").unwrap();
+    let script = shrimp::Script::parse(
+        r#"
+          fn prime_inner
+            include "inner.shrimp"
+          end
+          fn cache_outer
+            $ sh -c "while [ ! -f inner-ready ]; do sleep .01; done"
+            include "outer.shrimp"
+          end
+          parallel
+            call prime_inner
+            call cache_outer
+          end
+          include "outer.shrimp"
+          call result <- nested
+          write "result" <- "${result}"
+        "#,
+    )
+    .unwrap();
+
+    script.run(&Context::new(&root)).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("result")).unwrap(),
+        "available"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn cross_thread_include_cycles_fail_instead_of_deadlocking() {
     let root = sandbox("parallel-include-cycle");
